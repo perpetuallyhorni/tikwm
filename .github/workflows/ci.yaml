@@ -1,0 +1,38 @@
+name: CodeQL and Test
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+jobs:
+#   codeql:
+#     runs-on: ubuntu-latest
+#     permissions:
+#       actions: read
+#       contents: read
+#       security-events: write
+#     steps:
+#       - name: Checkout repository
+#         uses: actions/checkout@v4
+#       - name: Initialize CodeQL
+#         uses: github/codeql-action/init@v3
+#         with:
+#           languages: go
+#       - name: Perform CodeQL Analysis
+#         uses: github/codeql-action/analyze@v3
+#         with:
+#           category: /language:go
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.4'
+          cache: true
+      - name: Run tests
+        run: go test -v ./...

@@ -1,0 +1,25 @@
+ 
+name: Bug Report
+description: File a bug report
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Submit a bug report to help improve the project.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What is the issue?
+      placeholder: Please provide a clear and concise description of the issue.
+      value: "Bug description"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Activity log
+      description: Run tikwm with the `--debug` flag to produce a log file of the issue. Then, run tikwm --clean-logs to remove any sensitive information. After that, copy and paste the relevant log output. This will be automatically formatted into code, so no need for backticks.
+      render: shell

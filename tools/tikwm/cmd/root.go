@@ -1,0 +1,162 @@
+package cmd
+
+import (
+	"fmt"
+	"io"
+	"log"
+	"os"
+
+	"github.com/perpetuallyhorni/tikwm/pkg/client"
+	"github.com/perpetuallyhorni/tikwm/pkg/config"
+	"github.com/perpetuallyhorni/tikwm/pkg/storage"
+	"github.com/perpetuallyhorni/tikwm/pkg/storage/sqlite"
+	"github.com/perpetuallyhorni/tikwm/tools/tikwm/internal/cli"
+	"github.com/spf13/cobra"
+)
+
+var (
+	// cfg stores the application configuration.
+	cfg *config.Config
+	// appClient is the client used to interact with the TikTok API.
+	appClient *client.Client
+	// console is the CLI console for output.
+	console *cli.Console
+	// fileLogger is the logger for writing logs to a file.
+	fileLogger *log.Logger
+	// database is the storage interface for storing data.
+	database storage.Storer
+	// flagConfigPath is the path to the config file.
+	flagConfigPath string
+	// flagQuiet enables or disables quiet mode.
+	flagQuiet bool
+)
+
+// rootCmd represents the base command when called without any subcommands.
+var rootCmd = &cobra.Command{
+	Use:   "tikwm [command|targets...]",
+	Short: "A downloader for TikTok, powered by tikwm.com.",
+	Long: `A downloader for TikTok, powered by tikwm.com.
+
+Run 'tikwm [targets...]' to download content or use a specific command.
+For example:
+  tikwm some_user_name --quality hd
+  tikwm download https://www.tiktok.com/@some_user_name/video/12345
+  tikwm fix some_user_name`,
+	Args: cobra.ArbitraryArgs,
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		// Do not run hooks for completion, edit, or debug commands
+		if cmd.Name() == "completion" {
+			return nil
+		}
+		for c := cmd; c != nil; c = c.Parent() {
+			if c.Name() == "edit" || c.Name() == "debug" {
+				return nil
+			}
+		}
+
+		// Get the list of targets from arguments or config.
+		targets := getTargets(cfg, console, args)
+		// Check the flag to clean logs or not.
+		cleanLogs, _ := cmd.Flags().GetBool("clean-logs")
+
+		var err error
+		// Setup the file logger
+		fileLogger, err = setupFileLogger(cleanLogs, targets, cfg)
+		if err != nil {
+			return fmt.Errorf("failed to set up file logger: %w", err)
+		}
+
+		// If debug is enabled, write to both file and stderr.
+		if val, _ := cmd.Flags().GetBool("debug"); val {
+			mw := io.MultiWriter(fileLogger.Writer(), os.Stderr)
+			fileLogger.SetOutput(mw)
+		}
+
+		// Initialize the database.
+		database, err = sqlite.New(cfg.DatabasePath)
+		if err != nil {
+			return fmt.Errorf("error initializing database: %w", err)
+		}
+
+		// Create a new client.
+		appClient, err = client.New(cfg, database)
+		if err != nil {
+			return fmt.Errorf("error creating client: %w", err)
+		}
+		return nil
+	},
+	PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
+		// Close the database connection.
+		if database != nil {
+			return database.Close()
+		}
+		return nil
+	},
+	RunE: func(cmd *cobra.Command, args []string) error {
+		// Run the default download command.
+		return runDownload(cmd, args)
+	},
+	SilenceUsage:  true,
+	SilenceErrors: true,
+}
+
+// init initializes the command line interface.
+func init() {
+	// Initialize the console.
+	console = cli.New(false)
+
+	// Initialize cobra.
+	cobra.OnInitialize(func() {
+		// Check if quiet mode is enabled.
+		if val, err := rootCmd.Flags().GetBool("quiet"); err == nil && val {
+			flagQuiet = true
+			console = cli.New(true)
+		}
+
+		var err error
+		// Get the config path from the flags.
+		if val, err := rootCmd.Flags().GetString("config"); err == nil {
+			flagConfigPath = val
+		}
+
+		// Load the config file.
+		cfg, err = config.Load(flagConfigPath)
+		if err != nil {
+			console.Error("Error loading config: %v", err)
+			os.Exit(1)
+		}
+
+		// Apply command line flag overrides to the config.
+		applyFlagOverrides(rootCmd, cfg)
+	})
+
+	// Define persistent flags that are available to all subcommands.
+	rootCmd.PersistentFlags().StringVarP(&flagConfigPath, "config", "c", "", "Path to config file")
+	rootCmd.PersistentFlags().BoolVarP(&flagQuiet, "quiet", "q", false, "Quiet mode, no console output except for errors")
+	rootCmd.PersistentFlags().Bool("debug", false, "Log debug info to stderr and log file")
+	rootCmd.PersistentFlags().Bool("clean-logs", false, "Redact sensitive info (usernames, IDs, paths) from log files")
+
+	rootCmd.PersistentFlags().StringP("dir", "d", "", "Directory to save files (overrides config)")
+	rootCmd.PersistentFlags().String("targets", "", "Path to a file with a list of targets (overrides config)")
+	rootCmd.PersistentFlags().String("since", "", `Don't download videos earlier than this date (YYYY-MM-DD HH:MM:SS)`)
+	rootCmd.PersistentFlags().StringP("quality", "", "", `Video quality to download ("hd", "sd", "all"). Overrides config.`)
+	rootCmd.PersistentFlags().BoolP("force", "f", false, "Force download, ignore existing database entries")
+	rootCmd.PersistentFlags().Bool("retry-on-429", false, "Retry with backoff on rate limit instead of falling back to SD")
+	rootCmd.PersistentFlags().Bool("download-covers", false, `Enable downloading of post covers (see --cover-type).`)
+	rootCmd.PersistentFlags().String("cover-type", "", `Cover type to download ("cover", "origin", "dynamic"). Overrides config.`)
+	rootCmd.PersistentFlags().Bool("download-avatars", false, "Enable downloading of user avatars. Overrides config.")
+	rootCmd.PersistentFlags().Bool("save-post-title", false, "Save post title to a .txt file. Overrides config.")
+
+	// Add subcommands.
+	rootCmd.AddCommand(downloadCmd)
+	rootCmd.AddCommand(infoCmd)
+	rootCmd.AddCommand(editCmd)
+	rootCmd.AddCommand(coversCmd)
+	rootCmd.AddCommand(fixCmd)
+	rootCmd.AddCommand(debugCmd)
+}
+
+// Execute executes the root command.
+func Execute() error {
+	return rootCmd.Execute()
+}
