@@ -1,24 +1,91 @@
 version: 2
 
 builds:
-  - binary: tikwm
+  - id: tikwm-linux-amd64
+    main: ./tools/tikwm
+    binary: tikwm
+    flags:
+      - -mod=vendor
+    ldflags: "-s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}} -X main.builtBy=goreleaser"
+    env:
+      - CGO_ENABLED=1
     goos:
       - linux
+    goarch:
+      - amd64
+  - id: tikwm-linux-arm64
+    main: ./tools/tikwm
+    binary: tikwm
+    flags:
+      - -mod=vendor
+    ldflags: "-s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}} -X main.builtBy=goreleaser"
+    env:
+      - CGO_ENABLED=1
+    goos:
+      - linux
+    goarch:
+      - arm64
+  - id: tikwm-windows-amd64
+    main: ./tools/tikwm
+    binary: tikwm
+    flags:
+      - -mod=vendor
+    ldflags: "-s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}} -X main.builtBy=goreleaser"
+    env:
+      - CGO_ENABLED=1
+    goos:
       - windows
+    goarch:
+      - amd64
+  - id: tikwm-windows-arm64
+    main: ./tools/tikwm
+    binary: tikwm
+    flags:
+      - -mod=vendor
+    ldflags: "-s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}} -X main.builtBy=goreleaser"
+    env:
+      - CGO_ENABLED=1
+    goos:
+      - windows
+    goarch:
+      - arm64
+  - id: tikwm-darwin-amd64
+    main: ./tools/tikwm
+    binary: tikwm
+    flags:
+      - -mod=vendor
+    ldflags: "-s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}} -X main.builtBy=goreleaser"
+    env:
+      - CGO_ENABLED=1
+    goos:
       - darwin
     goarch:
       - amd64
-      - arm64
-    env:
-      - CGO_ENABLED=1
+  - id: tikwm-darwin-arm64
+    main: ./tools/tikwm
+    binary: tikwm
     flags:
       - -mod=vendor
-    ldflags:
-      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}} -X main.builtBy=goreleaser
-    main: ./tools/tikwm
+    ldflags: "-s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}} -X main.builtBy=goreleaser"
+    env:
+      - CGO_ENABLED=1
+    goos:
+      - darwin
+    goarch:
+      - arm64
+
 archives:
-  - formats: [ 'tar.gz', 'zip' ]
+  - id: default
+    builds:
+      - tikwm-linux-amd64
+      - tikwm-linux-arm64
+      - tikwm-windows-amd64
+      - tikwm-windows-arm64
+      - tikwm-darwin-amd64
+      - tikwm-darwin-arm64
+    formats: [ 'tar.gz', 'zip' ]
     name_template: '{{ .ProjectName }}_{{ .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}{{ if .Arm }}v{{ .Arm }}{{ end }}'
+
 checksum:
   name_template: 'checksums.txt'
 snapshot:
@@ -43,6 +110,5 @@ release:
     {{ .PreviousTag }}...{{ .Tag }}
   disable: false
   mode: replace
-
   extra_files:
     - glob: ./*.md
