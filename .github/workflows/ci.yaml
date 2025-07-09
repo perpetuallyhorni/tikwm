@@ -1,38 +1,111 @@
-name: CodeQL and Test
+name: Continuous Integration
+
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
+  issue_comment:
+    types:
+      - created
+
 jobs:
-#   codeql:
-#     runs-on: ubuntu-latest
-#     permissions:
-#       actions: read
-#       contents: read
-#       security-events: write
-#     steps:
-#       - name: Checkout repository
-#         uses: actions/checkout@v4
-#       - name: Initialize CodeQL
-#         uses: github/codeql-action/init@v3
-#         with:
-#           languages: go
-#       - name: Perform CodeQL Analysis
-#         uses: github/codeql-action/analyze@v3
-#         with:
-#           category: /language:go
-  test:
+  # codeql:
+  #   runs-on: ubuntu-latest
+  #   permissions:
+  #     actions: read
+  #     contents: read
+  #     security-events: write
+  #   steps:
+  #     - name: Checkout repository
+  #       uses: actions/checkout@v4
+  #     - name: Initialize CodeQL
+  #       uses: github/codeql-action/init@v3
+  #       with:
+  #         languages: go
+  #     - name: Perform CodeQL Analysis
+  #       uses: github/codeql-action/analyze@v3
+  #       with:
+  #         category: /language:go
+  # testing:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Checkout repository
+  #       uses: actions/checkout@v4
+  #     - name: Set up Go
+  #       uses: actions/setup-go@v5
+  #       with:
+  #         go-version: '1.24.4'
+  #         cache: true
+  #     - name: Run tests
+  #       run: go test -v ./...
+  linting:
+    # In order to run this workflow, the following conditions must be met:
+    # Comment was made on a pull request.
+    # Comment author has write-level permissions (Owner, Member, Collaborator).
+    # Comment body is exactly `/ci`.
+    if: |
+      github.event.issue.pull_request &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) &&
+      github.event.comment.body == '/ci'
+
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+
     steps:
-      - name: Checkout repository
+      - name: Add reaction to comment to show work is in progress
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          comment-id: ${{ github.event.comment.id }}
+          reactions: "rocket"
+
+      - name: Checkout PR Branch
         uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.issue.number }}/head
+          fetch-depth: 0
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.24.4'
           cache: true
-      - name: Run tests
-        run: go test -v ./...
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        id: lint
+        with:
+          version: v2.2.1
+          args: --timeout=5m --fix
+          only-new-issues: true
+          continue-on-error: true
+
+      - name: Commit and Push Fixes
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          # Check if the linter made any changes
+          if git diff --quiet && git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            echo "Committing auto-fixable linting changes."
+            git add .
+            git commit -m "chore(lint): Apply automated golangci-lint fixes"
+            git push
+          fi
+
+      - name: Report Status and Fail if Necessary
+        if: always()
+        run: |
+          if [ "${{ steps.lint.outcome }}" == "failure" ]; then
+            echo "::error::golangci-lint found unfixable issues. Please fix them manually."
+            curl -sSL -X POST -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                 -H "Accept: application/vnd.github.v3+json" \
+                 "https://api.github.com/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+                 -d '{"content":"-1"}'
+            exit 1
+          else
+            echo "Linting completed successfully. All issues were fixed automatically."
+            curl -sSL -X POST -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                 -H "Accept: application/vnd.github.v3+json" \
+                 "https://api.github.com/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+                 -d '{"content":"+1"}'
+          fi
