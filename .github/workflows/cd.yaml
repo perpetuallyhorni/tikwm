@@ -22,11 +22,10 @@ jobs:
         with:
           distribution: goreleaser
           version: '~> v2'
-          args: "" # Fuck you goreleaser
       - name: Sync Go Modules
         run: go mod vendor
       - name: Run GoReleaser build
-        run: goreleaser build --clean --id=tikwm-linux-amd64 --id=tikwm-linux-arm64 --id=tikwm-windows-amd64 --id=tikwm-windows-arm64 --id=tikwm-darwin-amd64 
+        run: goreleaser build --clean --id=tikwm-linux-amd64 --id=tikwm-linux-arm64 --id=tikwm-windows-amd64 --id=tikwm-windows-arm64 --id=tikwm-darwin-amd64
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -51,7 +50,6 @@ jobs:
         with:
           distribution: goreleaser
           version: '~> v2'
-          args: "" # Fuck you goreleaser
       - name: Sync Go Modules
         run: go mod vendor
       - name: Run GoReleaser build
