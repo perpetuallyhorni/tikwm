@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,10 +12,11 @@ import (
 	"strings"
 
 	"github.com/adrg/xdg"
+	tikwm "github.com/perpetuallyhorni/tikwm/internal"
 	"github.com/perpetuallyhorni/tikwm/pkg/client"
-	"github.com/perpetuallyhorni/tikwm/pkg/config"
 	"github.com/perpetuallyhorni/tikwm/pkg/logging"
 	"github.com/perpetuallyhorni/tikwm/tools/tikwm/internal/cli"
+	cliconfig "github.com/perpetuallyhorni/tikwm/tools/tikwm/internal/config"
 	"github.com/spf13/cobra"
 )
 
@@ -25,7 +27,7 @@ type ParsedTarget struct {
 }
 
 // applyFlagOverrides applies command-line flag overrides to the configuration.
-func applyFlagOverrides(cmd *cobra.Command, cfg *config.Config) {
+func applyFlagOverrides(cmd *cobra.Command, cfg *cliconfig.Config) {
 	if cmd.Flag("dir").Changed {
 		cfg.DownloadPath, _ = cmd.Flags().GetString("dir")
 	}
@@ -56,7 +58,7 @@ func applyFlagOverrides(cmd *cobra.Command, cfg *config.Config) {
 }
 
 // getTargets retrieves targets from command-line arguments or a targets file.
-func getTargets(cfg *config.Config, console *cli.Console, args []string) []string {
+func getTargets(cfg *cliconfig.Config, console *cli.Console, args []string) []string {
 	if len(args) > 0 {
 		return args
 	}
@@ -101,15 +103,20 @@ func parseTarget(target string) ParsedTarget {
 }
 
 // processTarget processes a single target, either downloading a post or a user's profile.
-func processTarget(target ParsedTarget, appClient *client.Client, logger *log.Logger, console *cli.Console, cfg *config.Config, force bool) error {
+func processTarget(target ParsedTarget, appClient *client.Client, logger *log.Logger, console *cli.Console, force bool) error {
 	switch target.Type {
 	case "post":
 		console.Info("Processing post: %s", target.Value)
 		err := appClient.DownloadPost(target.Value, force, logger)
-		if err == nil {
+		if err != nil {
+			if errors.Is(err, tikwm.ErrDiskSpace) {
+				return err // Propagate fatal error to halt execution
+			}
+			console.Error("Failed to process post %s: %v", target.Value, err)
+		} else {
 			console.Success("Successfully processed post %s", target.Value)
 		}
-		return err
+		return nil // Return nil for non-fatal errors to continue processing other targets
 	case "user":
 		username := client.ExtractUsername(target.Value)
 		progressCb := func(current, total int, msg string) {
@@ -124,18 +131,23 @@ func processTarget(target ParsedTarget, appClient *client.Client, logger *log.Lo
 		console.StartProgress(fmt.Sprintf("[%s] Preparing to fetch...", console.Bold.Sprint(username)))
 		err := appClient.DownloadProfile(username, force, logger, progressCb)
 		console.StopProgress()
-		if err == nil {
+		if err != nil {
+			if errors.Is(err, tikwm.ErrDiskSpace) {
+				return err // Propagate fatal error to halt execution
+			}
+			console.Error("Failed to process user %s: %v", username, err)
+		} else {
 			console.Success("Successfully processed user %s", username)
 		}
-		return err
+		return nil // Non-fatal error
 	default:
 		return fmt.Errorf("unknown target type for '%s'", target.Value)
 	}
 }
 
 // setupFileLogger sets up a file logger to log application events.
-func setupFileLogger(clean bool, targets []string, cfg *config.Config) (*log.Logger, error) {
-	logPath, err := xdg.StateFile(filepath.Join(config.AppName, "app.log"))
+func setupFileLogger(clean bool, targets []string, cfg *cliconfig.Config) (*log.Logger, error) {
+	logPath, err := xdg.StateFile(filepath.Join(cliconfig.AppName, "app.log"))
 	if err != nil {
 		return nil, fmt.Errorf("could not get log file path: %w", err)
 	}

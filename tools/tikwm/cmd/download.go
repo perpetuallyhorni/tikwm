@@ -31,7 +31,7 @@ func runDownload(cmd *cobra.Command, args []string) error {
 	for _, targetStr := range targets {
 		parsed := parseTarget(targetStr) // Parse the target string.
 		// Process the target.
-		err := processTarget(parsed, appClient, fileLogger, console, cfg, force)
+		err := processTarget(parsed, appClient, fileLogger, console, force)
 		if err != nil {
 			console.Error("Error processing target '%s': %v", targetStr, err) // Log an error if processing fails.
 		} else {
