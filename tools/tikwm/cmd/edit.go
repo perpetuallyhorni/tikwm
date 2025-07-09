@@ -8,7 +8,7 @@ import (
 	"runtime"
 
 	"github.com/adrg/xdg"
-	"github.com/perpetuallyhorni/tikwm/pkg/config"
+	cliconfig "github.com/perpetuallyhorni/tikwm/tools/tikwm/internal/config"
 	"github.com/spf13/cobra"
 )
 
@@ -31,7 +31,7 @@ var editConfigCmd = &cobra.Command{
 		configFilePath, _ := cmd.Flags().GetString("config")
 		if configFilePath == "" {
 			var findErr error
-			configFilePath, findErr = xdg.ConfigFile(filepath.Join(config.AppName, "config.yaml"))
+			configFilePath, findErr = xdg.ConfigFile(filepath.Join(cliconfig.AppName, "config.yaml"))
 			if findErr != nil {
 				return fmt.Errorf("could not determine default config file path: %w", findErr)
 			}

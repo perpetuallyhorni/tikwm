@@ -7,16 +7,15 @@ import (
 	"os"
 
 	"github.com/perpetuallyhorni/tikwm/pkg/client"
-	"github.com/perpetuallyhorni/tikwm/pkg/config"
-	"github.com/perpetuallyhorni/tikwm/pkg/storage"
 	"github.com/perpetuallyhorni/tikwm/pkg/storage/sqlite"
 	"github.com/perpetuallyhorni/tikwm/tools/tikwm/internal/cli"
+	cliconfig "github.com/perpetuallyhorni/tikwm/tools/tikwm/internal/config"
 	"github.com/spf13/cobra"
 )
 
 var (
 	// cfg stores the application configuration.
-	cfg *config.Config
+	cfg *cliconfig.Config
 	// appClient is the client used to interact with the TikTok API.
 	appClient *client.Client
 	// console is the CLI console for output.
@@ -24,7 +23,7 @@ var (
 	// fileLogger is the logger for writing logs to a file.
 	fileLogger *log.Logger
 	// database is the storage interface for storing data.
-	database storage.Storer
+	database *sqlite.DB
 	// flagConfigPath is the path to the config file.
 	flagConfigPath string
 	// flagQuiet enables or disables quiet mode.
@@ -78,8 +77,8 @@ For example:
 			return fmt.Errorf("error initializing database: %w", err)
 		}
 
-		// Create a new client.
-		appClient, err = client.New(cfg, database)
+		// Create a new client, passing the database which satisfies the storage.Storer interface.
+		appClient, err = client.New(&cfg.Config, database)
 		if err != nil {
 			return fmt.Errorf("error creating client: %w", err)
 		}
@@ -120,7 +119,7 @@ func init() {
 		}
 
 		// Load the config file.
-		cfg, err = config.Load(flagConfigPath)
+		cfg, err = cliconfig.Load(flagConfigPath)
 		if err != nil {
 			console.Error("Error loading config: %v", err)
 			os.Exit(1)
