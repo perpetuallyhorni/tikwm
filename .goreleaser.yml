@@ -10,7 +10,7 @@ builds:
       - amd64
       - arm64
     env:
-      - CGO_ENABLED=0
+      - CGO_ENABLED=1
     flags:
       - -mod=vendor
     ldflags:
