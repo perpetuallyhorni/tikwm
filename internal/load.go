@@ -3,6 +3,7 @@ package tikwm
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,16 @@ import (
 	"time"
 
 	"github.com/cavaliergopher/grab/v3"
+	"github.com/perpetuallyhorni/tikwm/internal/fs"
+)
+
+// ErrDiskSpace is returned when there is not enough disk space to perform a download.
+var ErrDiskSpace = errors.New("insufficient disk space")
+
+const (
+	// MinRequiredDiskSpace is the minimum disk space required (in bytes) for downloads
+	// where the file size is not known in advance (e.g., covers, avatars).
+	MinRequiredDiskSpace = 10 * 1024 * 1024 // 10MB
 )
 
 // DownloadOpt holds the options for downloading content.
@@ -51,6 +62,17 @@ func FileSHA256(path string) (string, error) {
 
 // DownloadAndHash downloads a file from a URL to a specific path and returns its SHA256 hash.
 func DownloadAndHash(url, fullPath string) (string, error) {
+	dir := path.Dir(fullPath)
+	available, err := fs.Available(dir)
+	if err != nil {
+		// Do not retry on disk check errors, treat as fatal for this operation.
+		return "", fmt.Errorf("could not check disk space for %s: %w", dir, err)
+	}
+	if available < MinRequiredDiskSpace {
+		// Do not retry if disk space is insufficient.
+		return "", fmt.Errorf("%w: %d bytes available in %s, requires at least %d bytes", ErrDiskSpace, available, dir, MinRequiredDiskSpace)
+	}
+
 	req, err := grab.NewRequest(fullPath, url) // Create a new download request.
 	if err != nil {
 		return "", err // Return an error if the request cannot be created.
@@ -94,28 +116,28 @@ func ValidateWithFfmpeg(ffmpegPath string) func(filename string) (bool, error) {
 	}
 }
 
-// getURLForAsset retrieves the download URL for a given asset type.
-func getURLForAsset(post *Post, assetType AssetType) (string, error) {
+// getURLAndSizeForAsset retrieves the download URL and expected size for a given asset type.
+func getURLAndSizeForAsset(post *Post, assetType AssetType) (url string, size int, err error) {
 	switch assetType {
 	case AssetHD:
-		return post.Hdplay, nil // Return the HD play URL.
+		return post.Hdplay, post.HdSize, nil
 	case AssetSD:
-		return post.Play, nil // Return the SD play URL.
+		return post.Play, post.Size, nil
 	case AssetSource:
 		// This might get called multiple times in a retry loop, which is intended.
-		sourceInfo, err := GetSourceEncode(post.ID()) // Get the source encode information.
+		sourceInfo, err := GetSourceEncode(post.ID())
 		if err != nil {
-			return "", fmt.Errorf("failed to get source encode URL: %w", err) // Return an error if the source encode URL cannot be retrieved.
+			return "", 0, fmt.Errorf("failed to get source encode URL: %w", err)
 		}
 		if sourceInfo == nil || sourceInfo.PlayURL == "" {
-			return "", fmt.Errorf("GetSourceEncode returned empty info/URL for post %s", post.ID()) // Return an error if the source encode URL is empty.
+			return "", 0, fmt.Errorf("GetSourceEncode returned empty info/URL for post %s", post.ID())
 		}
-		return sourceInfo.PlayURL, nil // Return the source encode play URL.
+		return sourceInfo.PlayURL, sourceInfo.Size, nil
 	default: // For album photos, assetType IS the URL
 		if strings.HasPrefix(string(assetType), "http") {
-			return string(assetType), nil // Return the URL as a string.
+			return string(assetType), 0, nil // Size is unknown for photos
 		}
-		return "", fmt.Errorf("invalid asset type for URL retrieval: %s", assetType) // Return an error if the asset type is invalid.
+		return "", 0, fmt.Errorf("invalid asset type for URL retrieval: %s", assetType)
 	}
 }
 
@@ -135,7 +157,7 @@ func (opt *DownloadOpt) downloadRetrying(post *Post, assetType AssetType, filena
 	// We MUST sleep and then potentially refresh the post object to get new download links.
 	if try > 0 {
 		time.Sleep(opt.TimeoutOnError) // Wait before retrying.
-		// For source, the URL is fetched fresh every time by getURLForAsset.
+		// For source, the URL is fetched fresh every time by getURLAndSizeForAsset.
 		// For HD/SD, we need to refresh the post object itself.
 		// Album photos also don't need a refresh, as the URL is static.
 		if assetType == AssetHD || assetType == AssetSD {
@@ -149,10 +171,28 @@ func (opt *DownloadOpt) downloadRetrying(post *Post, assetType AssetType, filena
 	}
 
 	// Attempt to get the URL from the (potentially refreshed) post object.
-	url, err := getURLForAsset(post, assetType) // Get the download URL for the asset type.
+	url, size, err := getURLAndSizeForAsset(post, assetType) // Get the download URL for the asset type.
 	if err != nil {
 		// This can happen if, e.g., GetSourceEncode fails. Retry.
 		return opt.downloadRetrying(post, assetType, filename, try+1, err)
+	}
+
+	// Disk space check
+	requiredSpace := uint64(0)
+	if size > 0 {
+		requiredSpace = uint64(size)
+	}
+	if requiredSpace == 0 { // For photos or if API doesn't provide size
+		requiredSpace = MinRequiredDiskSpace
+	}
+	available, diskErr := fs.Available(opt.Directory)
+	if diskErr != nil {
+		// Do not retry on disk check errors.
+		return fmt.Errorf("could not check disk space for %s: %w", opt.Directory, diskErr)
+	}
+	if available < requiredSpace {
+		// Do not retry if disk space is insufficient.
+		return fmt.Errorf("%w: %d bytes available in %s, requires at least %d bytes", ErrDiskSpace, available, opt.Directory, requiredSpace)
 	}
 
 	// If the URL is STILL missing, even after a potential refresh, it's a failure for this attempt. Retry.

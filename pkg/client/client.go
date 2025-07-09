@@ -1,6 +1,7 @@
 package client
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -158,21 +159,35 @@ func (c *Client) DownloadPost(url string, force bool, logger *log.Logger) error 
 		for _, assetType := range qualities {
 			if err := c.ensureVideoAsset(post, assetType, force, logger); err != nil {
 				logger.Printf("Could not process video for post %s (quality: %s): %v", post.ID(), assetType, err)
+				if errors.Is(err, tikwm.ErrDiskSpace) {
+					return err // Propagate fatal error
+				}
 			}
 		}
 	} else if post.IsAlbum() {
 		if err := c.ensureAlbum(post, force, logger); err != nil {
 			logger.Printf("Could not process album for post %s: %v", post.ID(), err)
+			if errors.Is(err, tikwm.ErrDiskSpace) {
+				return err // Propagate fatal error
+			}
 		}
 	}
 
 	if c.cfg.DownloadCovers {
 		if err := c.ensureCoverAsset(post, force, logger); err != nil {
 			logger.Printf("Could not download cover for post %s: %v", post.ID(), err)
+			if errors.Is(err, tikwm.ErrDiskSpace) {
+				return err // Propagate fatal error
+			}
 		}
 	}
 	if c.cfg.DownloadAvatars {
-		c.ensureAvatar(post, force, logger, make(map[string]bool))
+		if err := c.ensureAvatar(post, force, logger, make(map[string]bool)); err != nil {
+			logger.Printf("Could not download avatar for post %s: %v", post.Author.UniqueId, err)
+			if errors.Is(err, tikwm.ErrDiskSpace) {
+				return err // Propagate fatal error
+			}
+		}
 	}
 	return nil
 }
@@ -217,19 +232,31 @@ func (c *Client) DownloadProfile(username string, force bool, logger *log.Logger
 		progressCb(i, expectedCount, fmt.Sprintf("Checking %s", postID))
 		logger.Printf("--- Checking post %s (%d/%d) ---", postID, i, expectedCount)
 
+		var procErr error
 		if postFromFeed.IsAlbum() {
-			c.processAlbumInFeed(&postFromFeed, force, logger, progressCb, i, expectedCount)
+			procErr = c.processAlbumInFeed(&postFromFeed, force, logger, progressCb, i, expectedCount)
 		} else { // Is a video
-			c.processVideoInFeed(&postFromFeed, qualitiesNeeded, force, logger)
+			procErr = c.processVideoInFeed(&postFromFeed, qualitiesNeeded, force, logger)
+		}
+		if procErr != nil {
+			return procErr // Abort profile download on fatal error
 		}
 
 		// Process cover for all post types
 		if c.cfg.DownloadCovers {
-			c.processCoverInFeed(&postFromFeed, force, logger)
+			if err := c.processCoverInFeed(&postFromFeed, force, logger); err != nil {
+				return err // Abort profile download on fatal error
+			}
 		}
 		// Process avatar once per author per run
 		if c.cfg.DownloadAvatars {
-			c.ensureAvatar(&postFromFeed, force, logger, processedAvatars)
+			if err := c.ensureAvatar(&postFromFeed, force, logger, processedAvatars); err != nil {
+				if errors.Is(err, tikwm.ErrDiskSpace) {
+					return err // Abort profile download on fatal error
+				}
+				// Log non-fatal avatar errors but continue
+				logger.Printf("Could not download avatar for %s: %v", postFromFeed.Author.UniqueId, err)
+			}
 		}
 	}
 	progressCb(expectedCount, expectedCount, "Profile processing complete.")
@@ -237,16 +264,16 @@ func (c *Client) DownloadProfile(username string, force bool, logger *log.Logger
 }
 
 // ensureAvatar handles downloading a user's avatar if it's new.
-func (c *Client) ensureAvatar(post *tikwm.Post, force bool, logger *log.Logger, processed map[string]bool) {
+func (c *Client) ensureAvatar(post *tikwm.Post, force bool, logger *log.Logger, processed map[string]bool) error {
 	authorID := post.Author.UniqueId
 	if _, ok := processed[authorID]; ok {
-		return // Already handled this author in this session
+		return nil // Already handled this author in this session
 	}
 	processed[authorID] = true
 
 	if post.Author.Avatar == "" {
 		logger.Printf("No avatar URL found for author %s", authorID)
-		return
+		return nil
 	}
 
 	logger.Printf("Processing avatar for %s...", authorID)
@@ -255,29 +282,28 @@ func (c *Client) ensureAvatar(post *tikwm.Post, force bool, logger *log.Logger, 
 	// #nosec G301
 	if err := os.MkdirAll(creatorDir, 0755); err != nil {
 		logger.Printf("Could not create directory for avatar for %s: %v", authorID, err)
-		return
+		return err
 	}
 
 	// Download to a temporary path to get the hash first
 	tempPath := filepath.Join(creatorDir, fmt.Sprintf("avatar_temp_%d", time.Now().UnixNano()))
 	hash, err := tikwm.DownloadAndHash(post.Author.Avatar, tempPath)
 	if err != nil {
-		logger.Printf("Failed to download avatar for %s: %v", authorID, err)
 		_ = os.Remove(tempPath)
-		return
+		return err // Propagate download error
 	}
 
 	exists, err := c.db.AvatarExists(authorID, hash)
 	if err != nil {
 		logger.Printf("Failed to check DB for avatar for %s: %v", authorID, err)
 		_ = os.Remove(tempPath)
-		return
+		return err
 	}
 
 	if exists && !force {
 		logger.Printf("Avatar for %s (hash: %s) already exists in database. Discarding.", authorID, hash)
 		_ = os.Remove(tempPath)
-		return
+		return nil
 	}
 
 	// If it doesn't exist or we're forcing, rename to final destination and add to DB
@@ -287,14 +313,15 @@ func (c *Client) ensureAvatar(post *tikwm.Post, force bool, logger *log.Logger, 
 	if err := os.Rename(tempPath, finalPath); err != nil {
 		logger.Printf("Failed to move avatar to final destination for %s: %v", authorID, err)
 		_ = os.Remove(tempPath)
-		return
+		return err
 	}
 
 	if err := c.db.AddAvatar(authorID, hash); err != nil {
 		logger.Printf("Failed to add avatar to DB for %s: %v", authorID, err)
-		return
+		return err
 	}
 	logger.Printf("Successfully downloaded new avatar for %s to %s", authorID, finalPath)
+	return nil
 }
 
 // savePostTitle saves the post's title to a single, quality-agnostic text file.
@@ -317,7 +344,7 @@ func (c *Client) savePostTitle(post *tikwm.Post, logger *log.Logger) error {
 }
 
 // processVideoInFeed handles video-specific processing within the feed.
-func (c *Client) processVideoInFeed(postFromFeed *tikwm.Post, qualitiesNeeded []tikwm.AssetType, force bool, logger *log.Logger) {
+func (c *Client) processVideoInFeed(postFromFeed *tikwm.Post, qualitiesNeeded []tikwm.AssetType, force bool, logger *log.Logger) error {
 	postID := postFromFeed.ID()
 	validator := tikwm.ValidateWithFfmpeg(c.cfg.FfmpegPath)
 
@@ -326,14 +353,17 @@ func (c *Client) processVideoInFeed(postFromFeed *tikwm.Post, qualitiesNeeded []
 		fullPost, err := tikwm.GetPost(postID, true)
 		if err != nil {
 			logger.Printf("Failed to get full post details for %s: %v", postID, err)
-			return
+			return nil // Continue with other posts
 		}
 		for _, quality := range qualitiesNeeded {
 			if err := c.ensureVideoAsset(fullPost, quality, true, logger); err != nil {
 				logger.Printf("Error during forced download for %s (quality: %s): %v", postID, quality, err)
+				if errors.Is(err, tikwm.ErrDiskSpace) {
+					return err
+				}
 			}
 		}
-		return
+		return nil
 	}
 
 	for _, quality := range qualitiesNeeded {
@@ -346,6 +376,9 @@ func (c *Client) processVideoInFeed(postFromFeed *tikwm.Post, qualitiesNeeded []
 			logger.Printf("Error checking local asset for %s (quality: %s): %v. Will attempt download.", postID, quality, err)
 			if err := c.ensureVideoAsset(postFromFeed, quality, true, logger); err != nil {
 				logger.Printf("Error downloading video for %s: %v", postID, err)
+				if errors.Is(err, tikwm.ErrDiskSpace) {
+					return err
+				}
 			}
 			continue
 		}
@@ -354,6 +387,9 @@ func (c *Client) processVideoInFeed(postFromFeed *tikwm.Post, qualitiesNeeded []
 			logger.Printf("Asset for %s (quality: %s) not found. Downloading.", postID, quality)
 			if err := c.ensureVideoAsset(postFromFeed, quality, true, logger); err != nil {
 				logger.Printf("Error downloading video for %s: %v", postID, err)
+				if errors.Is(err, tikwm.ErrDiskSpace) {
+					return err
+				}
 			}
 			continue
 		}
@@ -391,9 +427,13 @@ func (c *Client) processVideoInFeed(postFromFeed *tikwm.Post, qualitiesNeeded []
 			// If we decided not to adopt for any reason (bad size, failed validation), re-download.
 			if err := c.ensureVideoAsset(postFromFeed, quality, true, logger); err != nil {
 				logger.Printf("Error re-downloading video for %s: %v", postID, err)
+				if errors.Is(err, tikwm.ErrDiskSpace) {
+					return err
+				}
 			}
 		}
 	}
+	return nil
 }
 
 // ensureVideoAsset handles the logic for making sure a video asset exists on disk and is recorded in the database.
@@ -464,33 +504,37 @@ func (c *Client) ensureCoverAsset(post *tikwm.Post, force bool, logger *log.Logg
 	return c.db.AddOrUpdateAsset(post.ID(), post.Author.UniqueId, post.CreateTime, assetType, sha)
 }
 
-func (c *Client) processCoverInFeed(post *tikwm.Post, force bool, logger *log.Logger) {
+func (c *Client) processCoverInFeed(post *tikwm.Post, force bool, logger *log.Logger) error {
 	if !c.cfg.DownloadCovers {
-		return
+		return nil
 	}
 	if err := c.ensureCoverAsset(post, force, logger); err != nil {
 		logger.Printf("Could not process cover for post %s: %v", post.ID(), err)
+		if errors.Is(err, tikwm.ErrDiskSpace) {
+			return err
+		}
 	}
+	return nil
 }
 
-func (c *Client) processAlbumInFeed(post *tikwm.Post, force bool, logger *log.Logger, progressCb ProgressCallback, current, total int) {
+func (c *Client) processAlbumInFeed(post *tikwm.Post, force bool, logger *log.Logger, progressCb ProgressCallback, current, total int) error {
 	postID := post.ID()
 	totalPhotosInAlbum := len(post.Images)
 	if totalPhotosInAlbum == 0 {
 		logger.Printf("Post %s is an album but has no images in feed data, skipping.", postID)
-		return
+		return nil
 	}
 
 	if !force {
 		countInDb, err := c.db.GetAlbumPhotoCount(postID)
 		if err != nil {
 			logger.Printf("DB check failed for album %s: %v", postID, err)
-			return
+			return nil // Continue with other posts
 		}
 		if countInDb >= totalPhotosInAlbum {
 			progressCb(current, total, fmt.Sprintf("Album %s complete", postID))
 			logger.Printf("--- Album %s already complete in database. ---", postID)
-			return
+			return nil
 		}
 	}
 
@@ -499,17 +543,21 @@ func (c *Client) processAlbumInFeed(post *tikwm.Post, force bool, logger *log.Lo
 	finalPost, fetchErr := c.getPostWithRetry(post, progressCb, current, total)
 	if fetchErr != nil {
 		logger.Printf("Failed to get full post details for %s: %v", postID, fetchErr)
-		return
+		return nil // Continue with other posts
 	}
 
 	if !finalPost.IsAlbum() || len(finalPost.Images) == 0 {
 		logger.Printf("Post %s is not a valid album after fetching full details, skipping.", postID)
-		return
+		return nil
 	}
 
 	if err := c.ensureAlbum(finalPost, force, logger); err != nil {
 		logger.Printf("Error processing album for post %s: %v", postID, err)
+		if errors.Is(err, tikwm.ErrDiskSpace) {
+			return err
+		}
 	}
+	return nil
 }
 
 // ensureAlbum handles the logic for downloading all photos in an album and recording them in the database.
@@ -544,6 +592,9 @@ func (c *Client) ensureAlbum(post *tikwm.Post, force bool, logger *log.Logger) e
 		_, sha, err := post.DownloadAlbumPhoto(photoIndex, tikwm.DownloadOpt{Directory: c.cfg.DownloadPath})
 		if err != nil {
 			logger.Printf("Failed to download photo %s: %v", albumPhotoID, err)
+			if errors.Is(err, tikwm.ErrDiskSpace) {
+				return err // Propagate fatal error
+			}
 			continue
 		}
 		if sha == "" {
@@ -591,6 +642,9 @@ func (c *Client) DownloadCoversForUser(username string, logger *log.Logger, prog
 		}
 		if err := c.ensureCoverAsset(post, false, logger); err != nil {
 			logger.Printf("Could not download cover for post %s: %v", post.ID(), err)
+			if errors.Is(err, tikwm.ErrDiskSpace) {
+				return err
+			}
 		}
 	}
 	return nil
@@ -625,6 +679,9 @@ func (c *Client) FixProfile(username string, logger *log.Logger, progressCb Prog
 			}
 			if err := c.ensureVideoAsset(post, assetType, true, logger); err != nil {
 				logger.Printf("Failed to process video for post %s (quality: %s): %v", post.ID(), assetType, err)
+				if errors.Is(err, tikwm.ErrDiskSpace) {
+					return err
+				}
 			}
 		}
 	}
