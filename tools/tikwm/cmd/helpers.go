@@ -185,6 +185,10 @@ func manageTargetsFile(targetLine, targetType, filePath string, console *cli.Con
 		console.Info("Moving processed user to the end of targets file.")
 		userLine := lines[targetIdx]
 		tempLines := append(lines[:targetIdx], lines[targetIdx+1:]...)
+		// Remove all trailing empty lines from tempLines
+		for len(tempLines) > 0 && strings.TrimSpace(tempLines[len(tempLines)-1]) == "" {
+			tempLines = tempLines[:len(tempLines)-1]
+		}
 		newLines = append(tempLines, userLine)
 	}
 
