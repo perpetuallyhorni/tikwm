@@ -24,7 +24,7 @@ jobs:
         with:
           distribution: goreleaser
           version: '~> v2'
-          args: release --clean --skip=publish --split -p1 --exclude="^darwin_arm64"
+          args: release --clean --skip=publish --exclude="^darwin_arm64"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Upload artifacts
@@ -35,8 +35,7 @@ jobs:
 
   build-mac-arm:
     name: Build for macOS ARM64
-    runs-on: macos-14
-    needs: build-main
+    runs-on: macos-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -54,7 +53,7 @@ jobs:
         with:
           distribution: goreleaser
           version: '~> v2'
-          args: release --clean --skip=publish --split -p1 --filter="^darwin_arm64"
+          args: release --clean --skip=publish --filter="^darwin_arm64"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Upload artifacts
