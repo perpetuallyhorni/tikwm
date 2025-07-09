@@ -4,9 +4,8 @@ on:
     tags:
       - 'v*'
 jobs:
-  release:
-    permissions:
-      contents: write
+  build-main:
+    name: Build All Except macOS ARM64
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -20,18 +19,75 @@ jobs:
           cache: true
       - name: Sync Go Modules
         run: go mod vendor
-      - name: Run GoReleaser
+      - name: Run GoReleaser (main targets)
         uses: goreleaser/goreleaser-action@v6
         with:
+          distribution: goreleaser
           version: '~> v2'
-          args: release --clean
+          args: release --clean --skip=publish --split -p1 --exclude="^darwin_arm64"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Update assets to GitHub releases
-        uses: softprops/action-gh-release@v2
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
         with:
-          files: |
-            dist/*.tar.gz
-            dist/*.zip
+          name: dist-main
+          path: dist
+
+  build-mac-arm:
+    name: Build for macOS ARM64
+    runs-on: macos-14
+    needs: build-main
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.4'
+          cache: true
+      - name: Sync Go Modules
+        run: go mod vendor
+      - name: Run GoReleaser (macOS ARM64 only)
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --clean --skip=publish --split -p1 --filter="^darwin_arm64"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-mac-arm
+          path: dist
+
+  publish:
+    name: Publish Release
+    needs: [build-main, build-mac-arm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.4'
+      - name: Download all dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Run GoReleaser publisher
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --clean --merge
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
