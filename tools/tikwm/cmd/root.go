@@ -10,6 +10,7 @@ import (
 	"github.com/perpetuallyhorni/tikwm/pkg/storage/sqlite"
 	"github.com/perpetuallyhorni/tikwm/tools/tikwm/internal/cli"
 	cliconfig "github.com/perpetuallyhorni/tikwm/tools/tikwm/internal/config"
+	"github.com/perpetuallyhorni/tikwm/tools/tikwm/internal/update"
 	"github.com/spf13/cobra"
 )
 
@@ -28,7 +29,18 @@ var (
 	flagConfigPath string
 	// flagQuiet enables or disables quiet mode.
 	flagQuiet bool
+	// version is the version of the application. It is set at build time.
+	// See the .goreleaser.yml file for more information.
+	version string
 )
+
+// SetVersion sets the version of the application.
+func SetVersion(v string) {
+	version = v
+	if rootCmd != nil {
+		rootCmd.Version = v
+	}
+}
 
 // rootCmd represents the base command when called without any subcommands.
 var rootCmd = &cobra.Command{
@@ -44,44 +56,77 @@ For example:
 	Args: cobra.ArbitraryArgs,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		// Do not run hooks for completion, edit, or debug commands
-		if cmd.Name() == "completion" {
-			return nil
-		}
+		isLightweightCmd := false
+		lightweightCommands := []string{"completion", "edit", "debug", "update"}
 		for c := cmd; c != nil; c = c.Parent() {
-			if c.Name() == "edit" || c.Name() == "debug" {
-				return nil
+			for _, lwCmd := range lightweightCommands {
+				if c.Name() == lwCmd {
+					isLightweightCmd = true
+					break
+				}
+			}
+			if isLightweightCmd {
+				break
 			}
 		}
 
-		// Get the list of targets from arguments or config.
-		targets := getTargets(cfg, console, args)
-		// Check the flag to clean logs or not.
-		cleanLogs, _ := cmd.Flags().GetBool("clean-logs")
-
-		var err error
-		// Setup the file logger
-		fileLogger, err = setupFileLogger(cleanLogs, targets, cfg)
-		if err != nil {
-			return fmt.Errorf("failed to set up file logger: %w", err)
+		// Return early for completion command.
+		if cmd.Name() == "completion" {
+			return nil
 		}
 
-		// If debug is enabled, write to both file and stderr.
-		if val, _ := cmd.Flags().GetBool("debug"); val {
-			mw := io.MultiWriter(fileLogger.Writer(), os.Stderr)
-			fileLogger.SetOutput(mw)
+		// The full setup for commands that need it.
+		if !isLightweightCmd {
+			targets := getTargets(cfg, console, args)
+			// Check the flag to clean logs or not.
+			cleanLogs, _ := cmd.Flags().GetBool("clean-logs")
+
+			var err error
+			// Setup the file logger
+			fileLogger, err = setupFileLogger(cleanLogs, targets, cfg)
+			if err != nil {
+				return fmt.Errorf("failed to set up file logger: %w", err)
+			}
+
+			// If debug is enabled, write to both file and stderr.
+			if val, _ := cmd.Flags().GetBool("debug"); val {
+				mw := io.MultiWriter(fileLogger.Writer(), os.Stderr)
+				fileLogger.SetOutput(mw)
+			}
+
+			// Initialize the database.
+			database, err = sqlite.New(cfg.DatabasePath)
+			if err != nil {
+				return fmt.Errorf("error initializing database: %w", err)
+			}
+
+			// Create a new client, passing the database which satisfies the storage.Storer interface.
+			appClient, err = client.New(&cfg.Config, database)
+			if err != nil {
+				return fmt.Errorf("error creating client: %w", err)
+			}
 		}
 
-		// Initialize the database.
-		database, err = sqlite.New(cfg.DatabasePath)
-		if err != nil {
-			return fmt.Errorf("error initializing database: %w", err)
+		// Update Check runs for commands that did the full setup.
+		if !isLightweightCmd && cfg.CheckForUpdates {
+			latestVersion, err := update.CheckForUpdate(version)
+			if err != nil {
+				// Non-fatal, just warn the user.
+				console.Warn("Update check failed: %v", err)
+			} else if latestVersion != "" {
+				if cfg.AutoUpdate {
+					console.Info("New version available (%s). Auto-updating...", latestVersion)
+					if err := update.ApplyUpdate(console, version); err != nil {
+						console.Error("Auto-update failed: %v", err)
+					}
+					// Exit after attempting update, successful or not. User should re-run.
+					os.Exit(0)
+				} else {
+					console.Warn("A new version of tikwm is available: %s. Run 'tikwm update' to upgrade.", console.Bold.Sprint(latestVersion))
+				}
+			}
 		}
 
-		// Create a new client, passing the database which satisfies the storage.Storer interface.
-		appClient, err = client.New(&cfg.Config, database)
-		if err != nil {
-			return fmt.Errorf("error creating client: %w", err)
-		}
 		return nil
 	},
 	PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
@@ -129,6 +174,9 @@ func init() {
 		applyFlagOverrides(rootCmd, cfg)
 	})
 
+	rootCmd.Version = version
+	rootCmd.SetVersionTemplate(`{{printf "%s\n" .Version}}`)
+
 	// Define persistent flags that are available to all subcommands.
 	rootCmd.PersistentFlags().StringVarP(&flagConfigPath, "config", "c", "", "Path to config file")
 	rootCmd.PersistentFlags().BoolVarP(&flagQuiet, "quiet", "q", false, "Quiet mode, no console output except for errors")
@@ -153,6 +201,7 @@ func init() {
 	rootCmd.AddCommand(coversCmd)
 	rootCmd.AddCommand(fixCmd)
 	rootCmd.AddCommand(debugCmd)
+	rootCmd.AddCommand(updateCmd)
 }
 
 // Execute executes the root command.

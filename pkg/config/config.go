@@ -1,5 +1,11 @@
 package config
 
+import (
+	"path/filepath"
+
+	"github.com/adrg/xdg"
+)
+
 // Config struct holds the core, application-agnostic configuration.
 type Config struct {
 	DownloadPath    string `koanf:"download_path"`    // Path to download videos and images.
@@ -15,8 +21,17 @@ type Config struct {
 
 // Default returns the default core configuration.
 func Default() *Config {
+	var defaultPath string
+	downloadDir := xdg.UserDirs.Download
+	if downloadDir != "" {
+		defaultPath = filepath.Join(downloadDir, "tikwm")
+	} else {
+		// Fallback for systems without a configured XDG downloads directory.
+		defaultPath = filepath.Join("downloads", "tikwm")
+	}
+
 	return &Config{
-		DownloadPath:    "./downloads",
+		DownloadPath:    defaultPath,
 		Quality:         "source",
 		Since:           "1970-01-01 00:00:00",
 		RetryOn429:      false,

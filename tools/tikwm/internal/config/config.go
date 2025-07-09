@@ -18,10 +18,12 @@ const AppName = "tikwm"
 
 // Config extends the core config with CLI-specific options.
 type Config struct {
-	config.Config `koanf:",squash"`
-	TargetsFile   string `koanf:"targets_file"`
-	DatabasePath  string `koanf:"database_path"`
-	Editor        string `koanf:"editor"`
+	config.Config   `koanf:",squash"`
+	TargetsFile     string `koanf:"targets_file"`
+	DatabasePath    string `koanf:"database_path"`
+	Editor          string `koanf:"editor"`
+	CheckForUpdates bool   `koanf:"check_for_updates"` // Check for new versions on startup.
+	AutoUpdate      bool   `koanf:"auto_update"`       // Automatically install new versions.
 }
 
 // Default returns the default CLI configuration.
@@ -37,10 +39,12 @@ func Default() (*Config, error) {
 	}
 
 	return &Config{
-		Config:       *coreCfg,
-		DatabasePath: dbPath,
-		TargetsFile:  targetsPath,
-		Editor:       "", // Default editor is determined in the 'edit' command logic
+		Config:          *coreCfg,
+		DatabasePath:    dbPath,
+		TargetsFile:     targetsPath,
+		Editor:          "", // Default editor is determined in the 'edit' command logic
+		CheckForUpdates: true,
+		AutoUpdate:      false,
 	}, nil
 }
 
@@ -122,7 +126,11 @@ retry_on_429: %t
 ffmpeg_path: "%s"
 # Editor to use for the 'edit' command. If empty, it will check $EDITOR, then common editors.
 editor: "%s"
-`, cfg.DownloadPath, cfg.TargetsFile, cfg.DatabasePath, cfg.Quality, cfg.Since, cfg.DownloadCovers, cfg.CoverType, cfg.DownloadAvatars, cfg.SavePostTitle, cfg.RetryOn429, cfg.FfmpegPath, cfg.Editor)
+# Check for new versions of tikwm on startup.
+check_for_updates: %t
+# Automatically install new versions of tikwm. If false, you will be notified to run 'tikwm update'.
+auto_update: %t
+`, cfg.DownloadPath, cfg.TargetsFile, cfg.DatabasePath, cfg.Quality, cfg.Since, cfg.DownloadCovers, cfg.CoverType, cfg.DownloadAvatars, cfg.SavePostTitle, cfg.RetryOn429, cfg.FfmpegPath, cfg.Editor, cfg.CheckForUpdates, cfg.AutoUpdate)
 	content = strings.ReplaceAll(content, "\\", "/")
 	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
 		return fmt.Errorf("failed to write default config file: %w", err)
@@ -141,6 +149,7 @@ func createDefaultTargetsFile(path string) error {
 #
 # Example:
 # losertron
+# @tiktok
 # https://www.tiktok.com/@creator/video/12345
 `
 	return os.WriteFile(path, []byte(content), 0600)
