@@ -80,7 +80,11 @@ func getLatestRelease() (*githubRelease, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch latest release info: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			fmt.Printf("Error closing response body: %v\n", err)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("bad status from GitHub API: %s", resp.Status)
@@ -182,7 +186,12 @@ func extractFileFromArchive(body io.Reader, filename string) (io.Reader, error) 
 		if err != nil {
 			return nil, fmt.Errorf("failed to create gzip reader: %w", err)
 		}
-		defer gzr.Close()
+		defer func() {
+			if err := gzr.Close(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error closing gzip reader: %v\n", err)
+			}
+		}()
+
 		tr := tar.NewReader(gzr)
 		for {
 			header, err := tr.Next()
@@ -265,7 +274,11 @@ func ApplyUpdate(console *cli.Console, currentVersion string) error {
 	if err != nil {
 		return fmt.Errorf("failed to download asset: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			console.Error("Failed to close response body: %v", err)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("bad status downloading asset: %s", resp.Status)
