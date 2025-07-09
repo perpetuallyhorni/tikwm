@@ -102,8 +102,8 @@ func submitSourceEncodeTask(videoID string) (string, error) {
 	formData := make(url.Values)                        // Initialize the map
 	formData.Set("web", "1")                            // Set the web parameter.
 	formData.Set("url", videoID)                        // Set the URL parameter.
-	// #nosec G107 -- URL is hardcoded
-	httpResp, err := http.PostForm(urlPath, formData) // Execute the HTTP request.
+	// Execute the HTTP request.
+	httpResp, err := http.PostForm(urlPath, formData) // #nosec G107
 	if err != nil {
 		return "", err // Return an error if the request failed.
 	}

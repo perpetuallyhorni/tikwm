@@ -112,7 +112,6 @@ func determineEditor(cmd *cobra.Command) (string, error) {
 
 // openInEditor opens the specified file in the given editor.
 func openInEditor(editor, filePath string) error {
-	// #nosec G204 -- The editor is determined from trusted sources (config, env, flags) or safe fallbacks.
 	cmd := exec.Command(editor, filePath)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
