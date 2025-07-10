@@ -5,7 +5,7 @@ on:
       - 'v*'
 jobs:
   build-main:
-    name: Build All Except macOS ARM64
+    name: Build for Linux & Windows
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -17,24 +17,27 @@ jobs:
         with:
           go-version: '1.24.4'
           cache: true
-      - name: Set up GoReleaser
-        uses: goreleaser/goreleaser-action@v6
-        with:
-          distribution: goreleaser
-          version: '~> v2'
-          args: "" # Fuck you goreleaser
+      - name: Install cross-compilers
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu gcc-mingw-w64-x86-64 gcc-mingw-w64-aarch64
       - name: Sync Go Modules
         run: go mod vendor
-      - name: Run GoReleaser build
-        run: goreleaser build --clean --id=tikwm-linux-amd64 --id=tikwm-linux-arm64 --id=tikwm-windows-amd64 --id=tikwm-windows-arm64 --id=tikwm-darwin-amd64 
-      - name: Upload artifacts
+      - name: Build all targets
+        run: |
+          TARGETS="linux/amd64/'' linux/arm64/aarch64-linux-gnu-gcc windows/amd64/x86_64-w64-mingw32-gcc windows/arm64/aarch64-w64-mingw32-gcc"
+          for target in $TARGETS; do
+            # Use ~ as a delimiter since GOOS/GOARCH can't contain it
+            IFS='/' read -r GOOS GOARCH CC <<< "$target"
+            echo "Building for $GOOS/$GOARCH..."
+            CGO_ENABLED=1 GOOS=$GOOS GOARCH=$GOARCH CC=$CC go build -v -mod=vendor -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o "dist/tikwm_${GOOS}_${GOARCH}/tikwm" ./tools/tikwm
+          done
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: dist-main
-          path: dist
+          path: dist/
 
-  build-mac-arm:
-    name: Build for macOS ARM64
+  build-mac:
+    name: Build for macOS
     runs-on: macos-latest
     steps:
       - name: Checkout
@@ -46,49 +49,89 @@ jobs:
         with:
           go-version: '1.24.4'
           cache: true
-      - name: Set up GoReleaser
-        uses: goreleaser/goreleaser-action@v6
-        with:
-          distribution: goreleaser
-          version: '~> v2'
-          args: "" # Fuck you goreleaser
       - name: Sync Go Modules
         run: go mod vendor
-      - name: Run GoReleaser build
-        run: goreleaser build --clean --id=tikwm-darwin-arm64
-      - name: Upload artifacts
+      - name: Build all targets
+        run: |
+          TARGETS="darwin/amd64 darwin/arm64"
+          for target in $TARGETS; do
+            IFS='/' read -r GOOS GOARCH <<< "$target"
+            echo "Building for $GOOS/$GOARCH..."
+            CGO_ENABLED=1 GOOS=$GOOS GOARCH=$GOARCH go build -v -mod=vendor -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o "dist/tikwm_${GOOS}_${GOARCH}/tikwm" ./tools/tikwm
+          done
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dist-mac-arm
-          path: dist
+          name: dist-mac
+          path: dist/
 
-  release:
+  publish:
     name: Publish Release
-    needs: [build-main, build-mac-arm]
+    needs: [build-main, build-mac]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.24.4'
-      - name: Download all dist artifacts
+
+      - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: Sync Go Modules
-        run: go mod vendor
-      - name: Run GoReleaser publisher
-        uses: goreleaser/goreleaser-action@v6
+      - name: Prepare release assets
+        run: |
+          mkdir -p release_assets
+          for dir in dist/*; do
+            if [ -d "$dir" ]; then
+              target_name=$(basename "$dir")
+              goos=$(echo "$target_name" | cut -d'_' -f2)
+              goarch=$(echo "$target_name" | cut -d'_' -f3)
+              
+              if [ "$goarch" = "amd64" ]; then arch_name="x86_64"; else arch_name="$goarch"; fi
+              
+              exe_name="tikwm"
+              archive_name="tikwm_${goos}_${arch_name}"
+              
+              if [ "$goos" = "windows" ]; then
+                mv "$dir/tikwm" "$dir/tikwm.exe"
+                exe_name="tikwm.exe"
+                archive_name="${archive_name}.zip"
+                (cd "$dir" && zip "$archive_name" "$exe_name")
+                mv "$dir/$archive_name" ../release_assets/
+              else
+                archive_name="${archive_name}.tar.gz"
+                (cd "$dir" && tar -czf "$archive_name" "$exe_name")
+                mv "$dir/$archive_name" ../release_assets/
+              fi
+            fi
+          done
+
+      - name: Generate checksums
+        run: (cd release_assets && sha256sum * > checksums.txt)
+
+      - name: Get Previous Tag
+        id: get_previous_tag
+        run: |
+          # Get the tag before the current one.
+          PREVIOUS_TAG=$(git tag --sort=v:refname | tail -n 2 | head -n 1)
+          # On the very first release, the above command will return the current tag.
+          # In that case, we fall back to the repository's first commit.
+          if [ "${{ github.ref_name }}" = "$PREVIOUS_TAG" ]; then
+            PREVIOUS_TAG=$(git rev-list --max-parents=0 HEAD)
+          fi
+          echo "tag=${PREVIOUS_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          distribution: goreleaser
-          version: '~> v2'
-          args: release --skip-build
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          generate_release_notes: true
+          body: |
+            
+            ---
+            ## Full Changelog
+            https://github.com/${{ github.repository }}/compare/${{ steps.get_previous_tag.outputs.tag }}...${{ github.ref_name }}
+          files: release_assets/*
