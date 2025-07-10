@@ -5,8 +5,8 @@ on:
       - 'v*'
 
 jobs:
-  build-main:
-    name: Build for Linux & Windows
+  build-linux:
+    name: Build for Linux
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -18,45 +18,67 @@ jobs:
         with:
           go-version: '1.24.4'
           cache: true
-
-      - name: Install C cross-compilers
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-
+      - name: Install ARM64 cross-compiler
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
       - name: Sync Go Modules
         run: go mod vendor
-
-      - name: Build all targets
+      - name: Build all Linux targets
         run: |
           TARGETS="linux/amd64 linux/arm64"
           for target in $TARGETS; do
             IFS='/' read -r GOOS GOARCH <<< "$target"
             echo "--- Building for $GOOS/$GOARCH ---"
-
-            # Set the C compiler based on the target
+            
             export CGO_ENABLED=1
             export GOOS=$GOOS
             export GOARCH=$GOARCH
-            
-            if [ "$GOOS" = "linux" ] && [ "$GOARCH" = "arm64" ]; then
+
+            # Set CC only when cross-compiling
+            if [ "$GOARCH" = "arm64" ]; then
               export CC=aarch64-linux-gnu-gcc
-            elif [ "$GOOS" = "windows" ] && [ "$GOARCH" = "amd64" ]; then
-              export CC=x86_64-w64-mingw32-gcc
-            elif [ "$GOOS" = "windows" ] && [ "$GOARCH" = "arm64" ]; then
-              export CC=aarch64-w64-mingw32-gcc
             else
-              # For the native target (linux/amd64), we don't need to set CC
               unset CC
             fi
 
             go build -v -mod=vendor -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o "dist/tikwm_${GOOS}_${GOARCH}/tikwm" ./tools/tikwm
           done
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dist-main
+          name: dist-linux
+          path: dist/
+
+  build-windows:
+    name: Build for Windows
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.4'
+          cache: true
+      - name: Sync Go Modules
+        run: go mod vendor
+      - name: Build all Windows targets
+        shell: bash
+        run: |
+          TARGETS="windows/amd64 windows/arm64"
+          for target in $TARGETS; do
+            IFS='/' read -r GOOS GOARCH <<< "$target"
+            echo "--- Building for $GOOS/$GOARCH ---"
+            
+            # On Windows, Go can find the native C compiler for both amd64 and arm64
+            # No need to set CC!
+            CGO_ENABLED=1 GOOS=$GOOS GOARCH=$GOARCH go build -v -mod=vendor -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o "dist/tikwm_${GOOS}_${GOARCH}/tikwm" ./tools/tikwm
+          done
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows
           path: dist/
 
   build-mac:
@@ -90,7 +112,7 @@ jobs:
 
   publish:
     name: Publish Release
-    needs: [build-main, build-mac]
+    needs: [build-linux, build-windows, build-mac]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -119,11 +141,11 @@ jobs:
                 exe_name="tikwm.exe"
                 archive_name="${archive_name}.zip"
                 (cd "$dir" && zip "$archive_name" "$exe_name")
-                mv "$dir/$archive_name" ../release_assets/
+                mv "$dir/$archive_name" release_assets/
               else
                 archive_name="${archive_name}.tar.gz"
                 (cd "$dir" && tar -czf "$archive_name" "$exe_name")
-                mv "$dir/$archive_name" ../release_assets/
+                mv "$dir/$archive_name" release_assets/
               fi
             fi
           done
@@ -133,7 +155,7 @@ jobs:
         id: get_previous_tag
         run: |
           PREVIOUS_TAG=$(git tag --sort=v:refname | tail -n 2 | head -n 1)
-          if [ "${{ github.ref_name }}" = "$PREVIOUS_TAG" ]; then
+          if [ -z "$PREVIOUS_TAG" ] || [ "${{ github.ref_name }}" = "$PREVIOUS_TAG" ]; then
             PREVIOUS_TAG=$(git rev-list --max-parents=0 HEAD)
           fi
           echo "tag=${PREVIOUS_TAG}" >> $GITHUB_OUTPUT
