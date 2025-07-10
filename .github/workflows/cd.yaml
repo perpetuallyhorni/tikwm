@@ -18,17 +18,41 @@ jobs:
         with:
           go-version: '1.24.4'
           cache: true
+
+      - name: Install C cross-compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
       - name: Sync Go Modules
         run: go mod vendor
+
       - name: Build all targets
         run: |
-          # This version does NOT install or set any C compilers, per user instruction.
-          TARGETS="linux/amd64 linux/arm64 windows/amd64 windows/arm64"
+          TARGETS="linux/amd64 linux/arm64
           for target in $TARGETS; do
             IFS='/' read -r GOOS GOARCH <<< "$target"
             echo "--- Building for $GOOS/$GOARCH ---"
-            CGO_ENABLED=1 GOOS=$GOOS GOARCH=$GOARCH go build -v -mod=vendor -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o "dist/tikwm_${GOOS}_${GOARCH}/tikwm" ./tools/tikwm
+
+            # Set the C compiler based on the target
+            export CGO_ENABLED=1
+            export GOOS=$GOOS
+            export GOARCH=$GOARCH
+            
+            if [ "$GOOS" = "linux" ] && [ "$GOARCH" = "arm64" ]; then
+              export CC=aarch64-linux-gnu-gcc
+            elif [ "$GOOS" = "windows" ] && [ "$GOARCH" = "amd64" ]; then
+              export CC=x86_64-w64-mingw32-gcc
+            elif [ "$GOOS" = "windows" ] && [ "$GOARCH" = "arm64" ]; then
+              export CC=aarch64-w64-mingw32-gcc
+            else
+              # For the native target (linux/amd64), we don't need to set CC
+              unset CC
+            fi
+
+            go build -v -mod=vendor -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o "dist/tikwm_${GOOS}_${GOARCH}/tikwm" ./tools/tikwm
           done
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
