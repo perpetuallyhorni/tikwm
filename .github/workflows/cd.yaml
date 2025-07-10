@@ -17,8 +17,6 @@ jobs:
         with:
           go-version: '1.24.4'
           cache: true
-      - name: Install cross-compilers
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu gcc-mingw-w64-x86-64 gcc-mingw-w64-aarch64
       - name: Sync Go Modules
         run: go mod vendor
       - name: Build all targets
