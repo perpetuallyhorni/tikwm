@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/perpetuallyhorni/tikwm/pkg/client"
@@ -28,6 +29,7 @@ and downloads any videos that are missing the qualities specified in your config
 		for _, target := range targets {
 			username := client.ExtractUsername(target) // Capture for closure
 			workerPool.Submit(func() {
+				ctx := context.Background()
 				console.AddTask(username, "Starting fix...", cli.OpFeedFetch)
 				progressCb := func(current, total int, msg string) {
 					console.UpdateTaskActivity(username)
@@ -38,7 +40,7 @@ and downloads any videos that are missing the qualities specified in your config
 					}
 				}
 
-				err := appClient.FixProfile(username, fileLogger, progressCb)
+				err := appClient.FixProfile(ctx, username, fileLogger, progressCb)
 				console.RemoveTask(username)
 
 				if err != nil {

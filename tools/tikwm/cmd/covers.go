@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/perpetuallyhorni/tikwm/pkg/client"
@@ -25,6 +26,7 @@ var coversCmd = &cobra.Command{
 		for _, target := range targets {
 			username := client.ExtractUsername(target) // Capture for closure
 			workerPool.Submit(func() {
+				ctx := context.Background()
 				console.AddTask(username, "Checking for missing covers...", cli.OpFeedFetch)
 				progressCb := func(current, total int, msg string) {
 					console.UpdateTaskActivity(username)
@@ -35,7 +37,7 @@ var coversCmd = &cobra.Command{
 					}
 				}
 
-				err := appClient.DownloadCoversForUser(username, fileLogger, progressCb)
+				err := appClient.DownloadCoversForUser(ctx, username, fileLogger, progressCb)
 				console.RemoveTask(username)
 
 				if err != nil {

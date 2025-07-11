@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -73,17 +74,25 @@ func getTargets(cfg *cliconfig.Config, console *cli.Console, args []string) []st
 	if len(args) > 0 {
 		return args
 	}
-	if cfg.TargetsFile == "" {
+	return getTargetsFromFile(cfg.TargetsFile, console)
+}
+
+// getTargetsFromFile reads targets from the specified file.
+func getTargetsFromFile(filePath string, console *cli.Console) []string {
+	if filePath == "" {
 		return nil
 	}
-	file, err := os.Open(cfg.TargetsFile)
+	file, err := os.Open(filePath) // #nosec G304
 	if err != nil {
-		console.Warn("Could not open targets file '%s': %v", cfg.TargetsFile, err)
+		// Don't warn if it just doesn't exist, as it may be created later.
+		if !os.IsNotExist(err) {
+			console.Warn("Could not open targets file '%s': %v", filePath, err)
+		}
 		return nil
 	}
 	defer func() {
 		if err := file.Close(); err != nil {
-			console.Warn("Could not close targets file '%s': %v", cfg.TargetsFile, err)
+			console.Warn("Could not close targets file '%s': %v", filePath, err)
 		}
 	}()
 
@@ -96,7 +105,7 @@ func getTargets(cfg *cliconfig.Config, console *cli.Console, args []string) []st
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		console.Warn("Error reading targets file '%s': %v", cfg.TargetsFile, err)
+		console.Warn("Error reading targets file '%s': %v", filePath, err)
 	}
 	return fileTargets
 }
@@ -113,47 +122,51 @@ func parseTarget(target string) ParsedTarget {
 	return ParsedTarget{Type: "user", Value: trimmedTarget}
 }
 
-// processTarget processes a single target, either downloading a post or a user's profile.
-func processTarget(target ParsedTarget, appClient *client.Client, logger *log.Logger, console *cli.Console, force bool) error {
+// processTargetWithContext processes a single target, either downloading a post or a user's profile.
+func processTargetWithContext(ctx context.Context, target ParsedTarget, appClient *client.Client, logger *log.Logger, console *cli.Console, force bool) error {
 	var taskID string
 	var err error
 
 	switch target.Type {
 	case "post":
-		// For a single post, we still add it to the UI for consistency.
 		taskID = "Post " + client.ExtractUsername(target.Value)
 		console.AddTask(taskID, "Downloading...", cli.OpDownload)
-		console.UpdateTaskActivity(taskID) // Immediately active
-		err = appClient.DownloadPost(target.Value, force, logger)
+		console.UpdateTaskActivity(taskID)
+		err = appClient.DownloadPost(ctx, target.Value, force, logger)
 
 	case "user":
 		username := client.ExtractUsername(target.Value)
 		taskID = username
-		// Add the task with "Preparing to fetch..." - this will be in the initial idle state.
 		console.AddTask(taskID, "Preparing to fetch...", cli.OpFeedFetch)
 
 		progressCb := func(current, total int, msg string) {
-			// The first call to this callback will activate the spinner.
 			console.UpdateTaskActivity(taskID)
 			console.UpdateTaskMessage(taskID, fmt.Sprintf("Processing %d/%d: %s", current, total, msg))
 		}
-		err = appClient.DownloadProfile(username, force, logger, progressCb)
+		err = appClient.DownloadProfile(ctx, username, force, logger, progressCb)
 
 	default:
 		err = fmt.Errorf("unknown target type for '%s'", target.Value)
 	}
 
 	console.RemoveTask(taskID)
+
 	if err != nil {
+		// Don't log cancellation as a failure, it's expected.
+		if errors.Is(err, context.Canceled) {
+			logger.Printf("Task for '%s' was cancelled.", target.Value)
+			return err
+		}
 		if errors.Is(err, tikwm.ErrDiskSpace) {
 			console.Error("Disk space error processing '%s'. Halting.", target.Value)
-			return err // Propagate fatal error to halt execution
+			return err // Propagate fatal error
 		}
 		console.Error("Failed to process target '%s': %v", target.Value, err)
-		return nil // Return nil for non-fatal errors to continue processing other targets
+		// Log the error, but return nil so other workers in a static pool can continue.
+		// The dynamic manager will handle the returned error differently.
+		return err
 	}
 
-	console.Success("Successfully processed target '%s'", target.Value)
 	return nil
 }
 
@@ -196,6 +209,7 @@ func manageTargetsFile(targetLine, targetType, filePath string, console *cli.Con
 		}
 	}
 	if targetIdx == -1 {
+		console.Info("Could not find target '%s' in targets file to update its status (file may have changed).", targetLine)
 		return nil
 	}
 
