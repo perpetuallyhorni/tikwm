@@ -40,6 +40,11 @@ func applyFlagOverrides(cmd *cobra.Command, cfg *cliconfig.Config) {
 	if cmd.Flag("quality").Changed {
 		cfg.Quality, _ = cmd.Flags().GetString("quality")
 	}
+	if cmd.Flag("workers").Changed {
+		if val, _ := cmd.Flags().GetInt("workers"); val > 0 {
+			cfg.MaxWorkers = val
+		}
+	}
 	if cmd.Flag("retry-on-429").Changed {
 		cfg.RetryOn429, _ = cmd.Flags().GetBool("retry-on-429")
 	}
@@ -104,45 +109,46 @@ func parseTarget(target string) ParsedTarget {
 
 // processTarget processes a single target, either downloading a post or a user's profile.
 func processTarget(target ParsedTarget, appClient *client.Client, logger *log.Logger, console *cli.Console, force bool) error {
+	var taskID string
+	var err error
+
 	switch target.Type {
 	case "post":
-		console.Info("Processing post: %s", target.Value)
-		err := appClient.DownloadPost(target.Value, force, logger)
-		if err != nil {
-			if errors.Is(err, tikwm.ErrDiskSpace) {
-				return err // Propagate fatal error to halt execution
-			}
-			console.Error("Failed to process post %s: %v", target.Value, err)
-		} else {
-			console.Success("Successfully processed post %s", target.Value)
-		}
-		return nil // Return nil for non-fatal errors to continue processing other targets
+		// For a single post, we still add it to the UI for consistency.
+		taskID = "Post " + client.ExtractUsername(target.Value)
+		console.AddTask(taskID, "Downloading...", cli.OpDownload)
+		console.UpdateTaskActivity(taskID) // Immediately active
+		err = appClient.DownloadPost(target.Value, force, logger)
+
 	case "user":
 		username := client.ExtractUsername(target.Value)
+		taskID = username
+		// Add the task with "Preparing to fetch..." - this will be in the initial idle state.
+		console.AddTask(taskID, "Preparing to fetch...", cli.OpFeedFetch)
+
 		progressCb := func(current, total int, msg string) {
-			if total > 0 {
-				progressMsg := fmt.Sprintf("[%s] Processing %d/%d: %s", console.Bold.Sprint(username), current, total, msg)
-				console.UpdateProgress(progressMsg)
-			} else {
-				progressMsg := fmt.Sprintf("[%s] %s", console.Bold.Sprint(username), msg)
-				console.UpdateProgress(progressMsg)
-			}
+			// The first call to this callback will activate the spinner.
+			console.UpdateTaskActivity(taskID)
+			console.UpdateTaskMessage(taskID, fmt.Sprintf("Processing %d/%d: %s", current, total, msg))
 		}
-		console.StartProgress(fmt.Sprintf("[%s] Preparing to fetch...", console.Bold.Sprint(username)))
-		err := appClient.DownloadProfile(username, force, logger, progressCb)
-		console.StopProgress()
-		if err != nil {
-			if errors.Is(err, tikwm.ErrDiskSpace) {
-				return err // Propagate fatal error to halt execution
-			}
-			console.Error("Failed to process user %s: %v", username, err)
-		} else {
-			console.Success("Successfully processed user %s", username)
-		}
-		return nil // Non-fatal error
+		err = appClient.DownloadProfile(username, force, logger, progressCb)
+
 	default:
-		return fmt.Errorf("unknown target type for '%s'", target.Value)
+		err = fmt.Errorf("unknown target type for '%s'", target.Value)
 	}
+
+	console.RemoveTask(taskID)
+	if err != nil {
+		if errors.Is(err, tikwm.ErrDiskSpace) {
+			console.Error("Disk space error processing '%s'. Halting.", target.Value)
+			return err // Propagate fatal error to halt execution
+		}
+		console.Error("Failed to process target '%s': %v", target.Value, err)
+		return nil // Return nil for non-fatal errors to continue processing other targets
+	}
+
+	console.Success("Successfully processed target '%s'", target.Value)
+	return nil
 }
 
 // setupFileLogger sets up a file logger to log application events.
@@ -190,14 +196,11 @@ func manageTargetsFile(targetLine, targetType, filePath string, console *cli.Con
 	var newLines []string
 	switch targetType {
 	case "post":
-		console.Info("Commenting out downloaded post in targets file.")
 		lines[targetIdx] = "# " + lines[targetIdx]
 		newLines = lines
 	case "user":
-		console.Info("Moving processed user to the end of targets file.")
 		userLine := lines[targetIdx]
 		tempLines := append(lines[:targetIdx], lines[targetIdx+1:]...)
-		// Remove all trailing empty lines from tempLines
 		for len(tempLines) > 0 && strings.TrimSpace(tempLines[len(tempLines)-1]) == "" {
 			tempLines = tempLines[:len(tempLines)-1]
 		}
