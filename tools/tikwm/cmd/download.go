@@ -143,7 +143,11 @@ func NewTargetManager(force bool) (*TargetManager, error) {
 
 // Run starts the main loop of the TargetManager.
 func (tm *TargetManager) Run() error {
-	defer tm.watcher.Close()
+	defer func() {
+		if err := tm.watcher.Close(); err != nil {
+			tm.logger.Printf("Error closing watcher: %v", err)
+		}
+	}()
 	targetsDir := filepath.Dir(tm.cfg.TargetsFile)
 	if err := os.MkdirAll(targetsDir, 0750); err != nil {
 		return fmt.Errorf("could not create targets directory '%s': %w", targetsDir, err)
@@ -406,7 +410,11 @@ func readLines(filePath string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			log.Printf("Error closing file: %v", err)
+		}
+	}()
 	var lines []string
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
