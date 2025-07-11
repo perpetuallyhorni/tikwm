@@ -11,8 +11,6 @@ import (
 	"os/exec"
 	"path"
 	"runtime"
-	"strings"
-	"sync"
 	"time"
 
 	"github.com/cavaliergopher/grab/v3"
@@ -116,111 +114,6 @@ func ValidateWithFfmpeg(ffmpegPath string) func(filename string) (bool, error) {
 	}
 }
 
-// getURLAndSizeForAsset retrieves the download URL and expected size for a given asset type.
-func getURLAndSizeForAsset(post *Post, assetType AssetType) (url string, size int, err error) {
-	switch assetType {
-	case AssetHD:
-		return post.Hdplay, post.HdSize, nil
-	case AssetSD:
-		return post.Play, post.Size, nil
-	case AssetSource:
-		// This might get called multiple times in a retry loop, which is intended.
-		sourceInfo, err := GetSourceEncode(post.ID())
-		if err != nil {
-			return "", 0, fmt.Errorf("failed to get source encode URL: %w", err)
-		}
-		if sourceInfo == nil || sourceInfo.PlayURL == "" {
-			return "", 0, fmt.Errorf("GetSourceEncode returned empty info/URL for post %s", post.ID())
-		}
-		return sourceInfo.PlayURL, sourceInfo.Size, nil
-	default: // For album photos, assetType IS the URL
-		if strings.HasPrefix(string(assetType), "http") {
-			return string(assetType), 0, nil // Size is unknown for photos
-		}
-		return "", 0, fmt.Errorf("invalid asset type for URL retrieval: %s", assetType)
-	}
-}
-
-// downloadRetrying attempts to download a file with retries and post refresh on failures.
-func (opt *DownloadOpt) downloadRetrying(post *Post, assetType AssetType, filename string, try int, lastErr error) error {
-	// Base case: If we've exceeded the number of retries, fail.
-	// If Retries is 3, we allow try 0, 1, 2, 3. The next attempt (try=4) fails.
-	if try > opt.Retries {
-		finalErr := lastErr
-		if finalErr == nil {
-			finalErr = fmt.Errorf("all retries failed")
-		}
-		return fmt.Errorf("failed after %d retries for post %s: %w", opt.Retries, post.ID(), finalErr) // Return an error after exceeding the maximum number of retries.
-	}
-
-	// If this is a retry attempt (try > 0), it means the previous attempt failed.
-	// We MUST sleep and then potentially refresh the post object to get new download links.
-	if try > 0 {
-		time.Sleep(opt.TimeoutOnError) // Wait before retrying.
-		// For source, the URL is fetched fresh every time by getURLAndSizeForAsset.
-		// For HD/SD, we need to refresh the post object itself.
-		// Album photos also don't need a refresh, as the URL is static.
-		if assetType == AssetHD || assetType == AssetSD {
-			refreshedPost, refreshErr := GetPost(post.ID(), true) // Refresh the post object to get new download links.
-			if refreshErr != nil {
-				// If refreshing fails, we retry again, passing the refresh error as the new lastErr.
-				return opt.downloadRetrying(post, assetType, filename, try+1, refreshErr)
-			}
-			*post = *refreshedPost // Update the post object with the new data.
-		}
-	}
-
-	// Attempt to get the URL from the (potentially refreshed) post object.
-	url, size, err := getURLAndSizeForAsset(post, assetType) // Get the download URL for the asset type.
-	if err != nil {
-		// This can happen if, e.g., GetSourceEncode fails. Retry.
-		return opt.downloadRetrying(post, assetType, filename, try+1, err)
-	}
-
-	// Disk space check
-	requiredSpace := uint64(0)
-	if size > 0 {
-		requiredSpace = uint64(size)
-	}
-	if requiredSpace == 0 { // For photos or if API doesn't provide size
-		requiredSpace = MinRequiredDiskSpace
-	}
-	available, diskErr := fs.Available(opt.Directory)
-	if diskErr != nil {
-		// Do not retry on disk check errors.
-		return fmt.Errorf("could not check disk space for %s: %w", opt.Directory, diskErr)
-	}
-	if available < requiredSpace {
-		// Do not retry if disk space is insufficient.
-		return fmt.Errorf("%w: %d bytes available in %s, requires at least %d bytes", ErrDiskSpace, available, opt.Directory, requiredSpace)
-	}
-
-	// If the URL is STILL missing, even after a potential refresh, it's a failure for this attempt. Retry.
-	if url == "" {
-		return opt.downloadRetrying(post, assetType, filename, try+1, fmt.Errorf("URL for asset type %s is missing", assetType)) // Retry if the URL is still missing.
-	}
-
-	// Attempt to download the file.
-	if err := opt.DownloadWith(url, filename); err != nil {
-		// If download fails, retry.
-		return opt.downloadRetrying(post, assetType, filename, try+1, err) // Retry if the download fails.
-	}
-
-	// For videos, attempt to validate the downloaded file.
-	if post.IsVideo() {
-		if valid, err := opt.ValidateWith(filename); err != nil {
-			// If validation itself errors, retry.
-			return opt.downloadRetrying(post, assetType, filename, try+1, err) // Retry if validation errors.
-		} else if !valid {
-			// If validation returns false (e.g., corrupt file), retry.
-			return opt.downloadRetrying(post, assetType, filename, try+1, fmt.Errorf("validation failed for %s", filename)) // Retry if validation fails.
-		}
-	}
-
-	// If all steps succeeded, we're done.
-	return nil // Return nil if the download was successful.
-}
-
 // Defaults sets default values for the DownloadOpt.
 func (opt *DownloadOpt) Defaults() *DownloadOpt {
 	ret := opt
@@ -276,7 +169,6 @@ var (
 	}
 	DefaultTimeout        = time.Millisecond * 100 // Default timeout for requests.
 	DefaultTimeoutOnError = time.Second * 10       // Default timeout between retries on error.
-	downloadSync          = &sync.Mutex{}          // Mutex for synchronizing downloads.
 )
 
 // IsAlbum returns true if the post is an album (has images).
@@ -287,86 +179,6 @@ func (post Post) IsAlbum() bool {
 // IsVideo returns true if the post is a video (not an album).
 func (post Post) IsVideo() bool {
 	return !post.IsAlbum()
-}
-
-// DownloadVideo downloads a specific quality of a video post.
-func (post Post) DownloadVideo(assetType AssetType, opts ...DownloadOpt) (file string, sha256 string, err error) {
-	switch assetType {
-	case AssetHD, AssetSD, AssetSource:
-		// Valid types
-	default:
-		return "", "", fmt.Errorf("unsupported asset type for video download: %s", assetType)
-	}
-
-	opt := &DownloadOpt{}
-	if len(opts) != 0 {
-		opt = &opts[0]
-	}
-	opt = opt.Defaults()
-	if !opt.NoSync {
-		downloadSync.Lock()
-		defer downloadSync.Unlock()
-	}
-
-	creatorDir := path.Join(opt.Directory, post.Author.UniqueId)
-	// #nosec G301
-	if err := os.MkdirAll(creatorDir, 0755); err != nil {
-		return "", "", fmt.Errorf("failed to create creator directory %s: %w", creatorDir, err)
-	}
-
-	filename := path.Join(creatorDir, opt.FilenameFormat(&post, 0, assetType))
-	if err := opt.downloadRetrying(&post, assetType, filename, 0, nil); err != nil {
-		return "", "", err
-	}
-	hash, err := FileSHA256(filename)
-	if err != nil {
-		_ = os.Remove(filename)
-		return "", "", fmt.Errorf("failed to hash %s: %w", filename, err)
-	}
-	return filename, hash, nil
-}
-
-// DownloadAlbumPhoto downloads a single photo from an album post at a specific index.
-func (post Post) DownloadAlbumPhoto(index int, opts ...DownloadOpt) (file string, sha256 string, err error) {
-	if !post.IsAlbum() {
-		return "", "", fmt.Errorf("post %s is not an album", post.ID())
-	}
-	if index < 0 || index >= len(post.Images) {
-		return "", "", fmt.Errorf("index %d is out of bounds for album with %d images", index, len(post.Images))
-	}
-
-	opt := &DownloadOpt{}
-	if len(opts) != 0 {
-		opt = &opts[0]
-	}
-	opt = opt.Defaults()
-	if !opt.NoSync {
-		downloadSync.Lock()
-		defer downloadSync.Unlock()
-	}
-
-	creatorDir := path.Join(opt.Directory, post.Author.UniqueId)
-	// #nosec G301
-	if err := os.MkdirAll(creatorDir, 0755); err != nil {
-		return "", "", fmt.Errorf("failed to create creator directory %s: %w", creatorDir, err)
-	}
-
-	url := post.Images[index]
-	filename := path.Join(creatorDir, opt.FilenameFormat(&post, index, ""))
-
-	// Create a copy of the post for the retry logic to avoid race conditions if used concurrently.
-	imgPost := post
-	// Pass the direct URL as a temporary "AssetType" for the retry logic.
-	if err := opt.downloadRetrying(&imgPost, AssetType(url), filename, 0, nil); err != nil {
-		return "", "", err
-	}
-
-	hash, err := FileSHA256(filename)
-	if err != nil {
-		_ = os.Remove(filename)
-		return "", "", fmt.Errorf("failed to hash %s: %w", filename, err)
-	}
-	return filename, hash, nil
 }
 
 // formatFilename formats the filename for downloaded files.

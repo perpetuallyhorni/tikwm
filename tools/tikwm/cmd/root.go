@@ -1,11 +1,13 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
 	"os"
 
+	tikwm "github.com/perpetuallyhorni/tikwm/internal"
 	"github.com/perpetuallyhorni/tikwm/pkg/client"
 	"github.com/perpetuallyhorni/tikwm/pkg/storage/sqlite"
 	"github.com/perpetuallyhorni/tikwm/tools/tikwm/internal/cli"
@@ -94,6 +96,9 @@ For example:
 				fileLogger.SetOutput(mw)
 			}
 
+			// Initialize the global rate limiter.
+			tikwm.InitRateLimiter(context.Background())
+
 			// Initialize the database.
 			database, err = sqlite.New(cfg.DatabasePath)
 			if err != nil {
@@ -101,7 +106,7 @@ For example:
 			}
 
 			// Create a new client, passing the database which satisfies the storage.Storer interface.
-			appClient, err = client.New(&cfg.Config, database)
+			appClient, err = client.New(&cfg.Config, database, fileLogger)
 			if err != nil {
 				return fmt.Errorf("error creating client: %w", err)
 			}
@@ -130,6 +135,8 @@ For example:
 		return nil
 	},
 	PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
+		// Stop the global rate limiter.
+		tikwm.StopRateLimiter()
 		// Close the database connection.
 		if database != nil {
 			return database.Close()
@@ -144,6 +151,7 @@ For example:
 	SilenceErrors: true,
 }
 
+// ... rest of root.go is unchanged
 // init initializes the command line interface.
 func init() {
 	// Initialize the console.
@@ -187,6 +195,7 @@ func init() {
 	rootCmd.PersistentFlags().String("targets", "", "Path to a file with a list of targets (overrides config)")
 	rootCmd.PersistentFlags().String("since", "", `Don't download videos earlier than this date (YYYY-MM-DD HH:MM:SS)`)
 	rootCmd.PersistentFlags().StringP("quality", "", "", `Video quality to download ("hd", "sd", "all"). Overrides config.`)
+	rootCmd.PersistentFlags().IntP("workers", "w", 0, "Number of concurrent workers (overrides config, default: num CPUs)")
 	rootCmd.PersistentFlags().BoolP("force", "f", false, "Force download, ignore existing database entries")
 	rootCmd.PersistentFlags().Bool("retry-on-429", false, "Retry with backoff on rate limit instead of falling back to SD")
 	rootCmd.PersistentFlags().Bool("download-covers", false, `Enable downloading of post covers (see --cover-type).`)

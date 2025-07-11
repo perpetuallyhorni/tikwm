@@ -1,6 +1,7 @@
 package tikwm
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,22 +10,62 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/perpetuallyhorni/tikwm/pkg/ratelimiter"
 )
 
 var (
 	// URL is the base URL for the tikwm API.
 	URL string = "https://tikwm.com/api"
-	// Timeout is the delay between API requests to avoid rate-limiting.
-	Timeout time.Duration = time.Second
+	// RequestDelay is the delay between API requests to avoid rate-limiting.
+	RequestDelay time.Duration = 1250 * time.Millisecond
 	// MaxUserFeedCount is the number of posts to fetch per user feed request.
 	MaxUserFeedCount int = 34
 	// Debug enables verbose logging of API responses.
 	Debug = false
 
-	requestSync = &sync.Mutex{} // requestSync is a mutex to synchronize API requests.
+	// apiRateLimiter is the global rate limiter for all API requests.
+	apiRateLimiter     *ratelimiter.RateLimiter
+	initRateLimiterMux sync.Mutex
+	rootCtx            context.Context
+	cancelRootCtx      context.CancelFunc
 )
+
+// InitRateLimiter initializes the global API rate limiter.
+// This must be called once at application startup.
+func InitRateLimiter(ctx context.Context) {
+	initRateLimiterMux.Lock()
+	defer initRateLimiterMux.Unlock()
+	if apiRateLimiter == nil {
+		rootCtx, cancelRootCtx = context.WithCancel(ctx)
+		apiRateLimiter = ratelimiter.New(RequestDelay, rootCtx)
+	}
+}
+
+// StopRateLimiter stops the global API rate limiter.
+// This must be called once at application shutdown.
+func StopRateLimiter() {
+	initRateLimiterMux.Lock()
+	defer initRateLimiterMux.Unlock()
+	if apiRateLimiter != nil {
+		cancelRootCtx()
+		apiRateLimiter.Stop()
+		apiRateLimiter = nil
+	}
+}
+
+// wait blocks until a permit is available from the global rate limiter.
+func wait() error {
+	initRateLimiterMux.Lock()
+	defer initRateLimiterMux.Unlock()
+	if apiRateLimiter == nil {
+		return errors.New("rate limiter not initialized, call InitRateLimiter first")
+	}
+	return apiRateLimiter.Wait()
+}
 
 // SourceEncodeResult represents the final successful result from the source encode endpoint.
 type SourceEncodeResult struct {
@@ -34,10 +75,10 @@ type SourceEncodeResult struct {
 
 // Raw executes a raw request to the tikwm API.
 func Raw(method string, query map[string]string) ([]byte, error) {
-	if Timeout != 0 {
-		requestSync.Lock() // Lock the mutex to ensure only one request is made at a time.
-		defer unlock()     // Unlock the mutex when the function returns.
+	if err := wait(); err != nil {
+		return nil, fmt.Errorf("rate limiter stopped: %w", err)
 	}
+
 	urlPath := fmt.Sprintf("%s/%s", URL, method)              // Construct the full URL.
 	req, err := http.NewRequest(http.MethodGet, urlPath, nil) // Create a new HTTP request.
 	if err != nil {
@@ -80,7 +121,15 @@ func RawParsed[T any](method string, query map[string]string) (*T, error) {
 		Data          *T      `json:"data"`           // Data is the response data.
 	}
 	if err := json.Unmarshal(data, &resp); err != nil { // Unmarshal the response body.
-		return nil, err // Return an error if the response body could not be unmarshaled.
+		// Attempt to unmarshal just the error part for better diagnostics on malformed success responses
+		var errResp struct {
+			Code int    `json:"code"`
+			Msg  string `json:"msg"`
+		}
+		if json.Unmarshal(data, &errResp) == nil && errResp.Code != 0 {
+			return nil, fmt.Errorf("tikwm error: %s (%d) [%s]", errResp.Msg, errResp.Code, method)
+		}
+		return nil, fmt.Errorf("failed to unmarshal tikwm response: %w. raw: %s", err, string(data))
 	}
 	if resp.Code != 0 { // Check if the response code is not 0.
 		queryStr := "???"                                // Default query string.
@@ -94,6 +143,10 @@ func RawParsed[T any](method string, query map[string]string) (*T, error) {
 
 // submitSourceEncodeTask submits a video for source encoding and returns a task ID.
 func submitSourceEncodeTask(videoID string) (string, error) {
+	if err := wait(); err != nil {
+		return "", fmt.Errorf("rate limiter stopped: %w", err)
+	}
+
 	var resp struct {
 		TaskID string `json:"task_id"` // TaskID is the ID of the source encoding task.
 	}
@@ -102,6 +155,7 @@ func submitSourceEncodeTask(videoID string) (string, error) {
 	formData := make(url.Values)                        // Initialize the map
 	formData.Set("web", "1")                            // Set the web parameter.
 	formData.Set("url", videoID)                        // Set the URL parameter.
+
 	// Execute the HTTP request.
 	httpResp, err := http.PostForm(urlPath, formData) // #nosec G107
 	if err != nil {
@@ -140,9 +194,12 @@ func pollSourceEncodeResult(taskID string) (*SourceEncodeResult, error) {
 		Detail *SourceEncodeResult `json:"detail"` // Detail is the details of the source encoding result.
 	}
 	for i := 0; i < 60; i++ { // Poll for up to 60 seconds.
-		time.Sleep(1 * time.Second)                                                                        // Wait for 1 second.
-		data, err := RawParsed[json.RawMessage]("video/task/result", map[string]string{"task_id": taskID}) // Execute the raw request.
+		// The polling loop itself calls RawParsed, which is rate-limited.
+		data, err := RawParsed[json.RawMessage]("video/task/result", map[string]string{"task_id": taskID})
 		if err != nil {
+			if strings.Contains(err.Error(), "(-1)") { // Is it a rate limit error?
+				time.Sleep(2 * time.Second) // Wait a bit longer if rate limited during polling
+			}
 			continue // Ignore transient errors and retry
 		}
 		if err := json.Unmarshal(*data, &resp); err != nil { // Unmarshal the response data.
@@ -155,6 +212,8 @@ func pollSourceEncodeResult(taskID string) (*SourceEncodeResult, error) {
 			return nil, errors.New("source encode task failed or no higher quality available") // Return an error if the source encoding task failed.
 		}
 		// Status is still pending, continue polling.
+		// A small sleep is good practice to not hammer the API, even with rate limiting.
+		time.Sleep(1 * time.Second)
 	}
 	return nil, errors.New("source encode task timed out") // Return an error if the source encoding task timed out.
 }
@@ -187,9 +246,4 @@ func GetUserFeedRaw(uniqueID string, count int, cursor string) (*UserFeed, error
 func GetUserDetail(uniqueID string) (*UserDetail, error) {
 	query := map[string]string{"unique_id": uniqueID} // Construct the query parameters.
 	return RawParsed[UserDetail]("user/info", query)  // Execute the raw request.
-}
-
-func unlock() {
-	time.Sleep(Timeout)  // Wait for the timeout duration.
-	requestSync.Unlock() // Unlock the mutex.
 }

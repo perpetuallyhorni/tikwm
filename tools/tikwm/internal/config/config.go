@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/adrg/xdg"
@@ -24,6 +25,7 @@ type Config struct {
 	Editor          string `koanf:"editor"`
 	CheckForUpdates bool   `koanf:"check_for_updates"` // Check for new versions on startup.
 	AutoUpdate      bool   `koanf:"auto_update"`       // Automatically install new versions.
+	MaxWorkers      int    `koanf:"max_workers"`       // Maximum number of concurrent workers.
 }
 
 // Default returns the default CLI configuration.
@@ -45,6 +47,7 @@ func Default() (*Config, error) {
 		Editor:          "", // Default editor is determined in the 'edit' command logic
 		CheckForUpdates: true,
 		AutoUpdate:      false,
+		MaxWorkers:      runtime.NumCPU(),
 	}, nil
 }
 
@@ -104,6 +107,10 @@ download_path: "%s"
 targets_file: "%s"
 # Path to the SQLite database to track downloaded posts.
 database_path: "%s"
+# Maximum number of concurrent workers for processing targets.
+# API calls are still sequential (1/sec), but downloads can be parallel.
+# Defaults to the number of CPU cores.
+max_workers: %d
 # Quality to download videos in. Options: "source", "hd", "sd", "all".
 quality: "%s"
 # Default date to download content since (YYYY-MM-DD HH:MM:SS).
@@ -130,7 +137,7 @@ editor: "%s"
 check_for_updates: %t
 # Automatically install new versions of tikwm. If false, you will be notified to run 'tikwm update'.
 auto_update: %t
-`, cfg.DownloadPath, cfg.TargetsFile, cfg.DatabasePath, cfg.Quality, cfg.Since, cfg.DownloadCovers, cfg.CoverType, cfg.DownloadAvatars, cfg.SavePostTitle, cfg.RetryOn429, cfg.FfmpegPath, cfg.Editor, cfg.CheckForUpdates, cfg.AutoUpdate)
+`, cfg.DownloadPath, cfg.TargetsFile, cfg.DatabasePath, cfg.MaxWorkers, cfg.Quality, cfg.Since, cfg.DownloadCovers, cfg.CoverType, cfg.DownloadAvatars, cfg.SavePostTitle, cfg.RetryOn429, cfg.FfmpegPath, cfg.Editor, cfg.CheckForUpdates, cfg.AutoUpdate)
 	content = strings.ReplaceAll(content, "\\", "/")
 	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
 		return fmt.Errorf("failed to write default config file: %w", err)

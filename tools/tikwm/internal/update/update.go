@@ -1,3 +1,4 @@
+// tools/tikwm/internal/update/update.go
 package update
 
 import (
