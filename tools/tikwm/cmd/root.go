@@ -203,6 +203,10 @@ func init() {
 	rootCmd.PersistentFlags().Bool("download-avatars", false, "Enable downloading of user avatars. Overrides config.")
 	rootCmd.PersistentFlags().Bool("save-post-title", false, "Save post title to a .txt file. Overrides config.")
 
+	// Caching flags
+	rootCmd.PersistentFlags().Bool("feed-cache", false, "Enable or disable caching of user feeds. Overrides config.")
+	rootCmd.PersistentFlags().String("feed-cache-ttl", "", `Time-to-live for feed cache, e.g., "1h", "30m". Overrides config.`)
+
 	// Add subcommands.
 	rootCmd.AddCommand(downloadCmd)
 	rootCmd.AddCommand(infoCmd)

@@ -1,6 +1,7 @@
 package client
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adrg/xdg"
 	tikwm "github.com/perpetuallyhorni/tikwm/internal"
 	"github.com/perpetuallyhorni/tikwm/internal/fs"
 	"github.com/perpetuallyhorni/tikwm/pkg/config"
@@ -222,7 +224,6 @@ func (c *Client) DownloadProfile(username string, force bool, logger *log.Logger
 			progressCb(count, 0, fmt.Sprintf("%d posts found", count))
 		},
 	}
-	// The core GetUserFeed function now needs the client for dispatching.
 	postChan, expectedCount, err := c.getUserFeed(username, feedOpt)
 	if err != nil {
 		return err
@@ -879,24 +880,131 @@ func (c *Client) getURLAndSizeForAsset(post *tikwm.Post, assetType tikwm.AssetTy
 }
 
 // getUserFeed fetches the user feed and returns a channel to which posts are sent.
+// It implements a simple, time-based cache to speed up repeated runs.
 func (c *Client) getUserFeed(uniqueID string, opt *tikwm.FeedOpt) (chan tikwm.Post, int, error) {
 	opt = opt.Defaults()
-	posts, err := c.userFeedSinceInternal(uniqueID, "0", opt, 0)
+
+	if c.cfg.FeedCache {
+		posts, err := c.getFeedFromCache(uniqueID, opt)
+		if err == nil {
+			// Cache hit and successful read
+			return c.postsToChannel(posts), len(posts), nil
+		}
+		// Log cache miss/error but continue to fetch from API
+		c.logger.Printf("Cache miss for user %s: %v. Fetching from API.", uniqueID, err)
+	}
+
+	// Fetch from API if cache is disabled, missed, or failed
+	allPosts, err := c.userFeedSinceInternal(uniqueID, "0", opt, 0)
 	if err != nil {
 		return nil, 0, err
 	}
 
+	// Save to cache if enabled
+	if c.cfg.FeedCache {
+		if cacheErr := c.saveFeedToCache(uniqueID, allPosts); cacheErr != nil {
+			// Log caching error but don't fail the operation
+			c.logger.Printf("Failed to write feed to cache for %s: %v", uniqueID, cacheErr)
+		}
+	}
+
+	return c.postsToChannel(allPosts), len(allPosts), nil
+}
+
+// postsToChannel converts a slice of posts to a channel of posts for processing.
+func (c *Client) postsToChannel(posts []tikwm.Post) chan tikwm.Post {
+	returnChan := make(chan tikwm.Post, len(posts))
 	go func() {
-		defer close(opt.ReturnChan)
+		defer close(returnChan)
 		// Reverse posts to process from oldest to newest.
 		for i := 0; i < len(posts)/2; i++ {
 			posts[i], posts[len(posts)-i-1] = posts[len(posts)-i-1], posts[i]
 		}
 		for _, post := range posts {
-			opt.ReturnChan <- post
+			returnChan <- post
 		}
 	}()
-	return opt.ReturnChan, len(posts), err
+	return returnChan
+}
+
+// getFeedFromCache tries to load a user's feed from the local cache.
+func (c *Client) getFeedFromCache(uniqueID string, opt *tikwm.FeedOpt) ([]tikwm.Post, error) {
+	cachePath, err := c.getFeedCachePath(uniqueID)
+	if err != nil {
+		return nil, fmt.Errorf("could not determine cache path: %w", err)
+	}
+
+	info, err := os.Stat(cachePath)
+	if err != nil {
+		return nil, fmt.Errorf("cache file not found: %w", err) // This is os.ErrNotExist in most cases
+	}
+
+	ttl, err := time.ParseDuration(c.cfg.FeedCacheTTL)
+	if err != nil {
+		// Fallback to a default if the config is invalid, but log it.
+		c.logger.Printf("Invalid FeedCacheTTL '%s', falling back to 1h: %v", c.cfg.FeedCacheTTL, err)
+		ttl = 1 * time.Hour
+	}
+
+	if time.Since(info.ModTime()) > ttl {
+		return nil, fmt.Errorf("cache expired (older than %s)", c.cfg.FeedCacheTTL)
+	}
+
+	c.logger.Printf("Using cached feed for %s (from %s)", uniqueID, cachePath)
+	data, err := os.ReadFile(cachePath) // #nosec G304
+	if err != nil {
+		return nil, fmt.Errorf("failed to read cache file: %w", err)
+	}
+
+	var cachedPosts []tikwm.Post
+	if err := json.Unmarshal(data, &cachedPosts); err != nil {
+		return nil, fmt.Errorf("failed to parse cache file: %w", err)
+	}
+
+	// Filter the cached posts based on the current run's options (e.g., a new --since date).
+	// The cached posts are sorted newest to oldest, so we can break early.
+	var filteredPosts []tikwm.Post
+	for _, post := range cachedPosts {
+		if !opt.While(&post) {
+			break
+		}
+		if !opt.Filter(&post) {
+			continue
+		}
+		filteredPosts = append(filteredPosts, post)
+	}
+
+	opt.OnFeedProgress(len(filteredPosts))
+	return filteredPosts, nil
+}
+
+// saveFeedToCache writes a user's feed to a local cache file.
+func (c *Client) saveFeedToCache(uniqueID string, posts []tikwm.Post) error {
+	cachePath, err := c.getFeedCachePath(uniqueID)
+	if err != nil {
+		return fmt.Errorf("could not determine cache path: %w", err)
+	}
+
+	c.logger.Printf("Saving feed for %s to cache: %s", uniqueID, cachePath)
+	if err := os.MkdirAll(filepath.Dir(cachePath), 0750); err != nil {
+		return fmt.Errorf("failed to create cache directory: %w", err)
+	}
+
+	data, err := json.Marshal(posts)
+	if err != nil {
+		return fmt.Errorf("failed to serialize feed for caching: %w", err)
+	}
+
+	// #nosec G306
+	if err := os.WriteFile(cachePath, data, 0640); err != nil {
+		return fmt.Errorf("failed to write cache file: %w", err)
+	}
+	return nil
+}
+
+// getFeedCachePath returns the path to the feed cache file for a specific user.
+func (c *Client) getFeedCachePath(username string) (string, error) {
+	return xdg.CacheFile(filepath.Join("tikwm", "feeds", username+".json"))
 }
 
 // userFeedSinceInternal is a recursive function that fetches user feed posts since a given cursor.

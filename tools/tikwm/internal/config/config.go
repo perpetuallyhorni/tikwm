@@ -131,13 +131,21 @@ save_post_title: %t
 retry_on_429: %t
 # Path to the ffmpeg executable. Used to validate downloaded videos.
 ffmpeg_path: "%s"
+
+# Caching
+# Enable caching of user feeds to speed up repeated runs.
+feed_cache: %t
+# How long to keep feed cache before it's considered stale (e.g., "1h", "30m", "2h15m").
+feed_cache_ttl: "%s"
+
+# Other
 # Editor to use for the 'edit' command. If empty, it will check $EDITOR, then common editors.
 editor: "%s"
 # Check for new versions of tikwm on startup.
 check_for_updates: %t
 # Automatically install new versions of tikwm. If false, you will be notified to run 'tikwm update'.
 auto_update: %t
-`, cfg.DownloadPath, cfg.TargetsFile, cfg.DatabasePath, cfg.MaxWorkers, cfg.Quality, cfg.Since, cfg.DownloadCovers, cfg.CoverType, cfg.DownloadAvatars, cfg.SavePostTitle, cfg.RetryOn429, cfg.FfmpegPath, cfg.Editor, cfg.CheckForUpdates, cfg.AutoUpdate)
+`, cfg.DownloadPath, cfg.TargetsFile, cfg.DatabasePath, cfg.MaxWorkers, cfg.Quality, cfg.Since, cfg.DownloadCovers, cfg.CoverType, cfg.DownloadAvatars, cfg.SavePostTitle, cfg.RetryOn429, cfg.FfmpegPath, cfg.FeedCache, cfg.FeedCacheTTL, cfg.Editor, cfg.CheckForUpdates, cfg.AutoUpdate)
 	content = strings.ReplaceAll(content, "\\", "/")
 	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
 		return fmt.Errorf("failed to write default config file: %w", err)
