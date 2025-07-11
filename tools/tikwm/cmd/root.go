@@ -9,10 +9,10 @@ import (
 
 	tikwm "github.com/perpetuallyhorni/tikwm/internal"
 	"github.com/perpetuallyhorni/tikwm/pkg/client"
+	"github.com/perpetuallyhorni/tikwm/pkg/network"
 	"github.com/perpetuallyhorni/tikwm/pkg/storage/sqlite"
 	"github.com/perpetuallyhorni/tikwm/tools/tikwm/internal/cli"
 	cliconfig "github.com/perpetuallyhorni/tikwm/tools/tikwm/internal/config"
-	"github.com/perpetuallyhorni/tikwm/tools/tikwm/internal/network"
 	"github.com/perpetuallyhorni/tikwm/tools/tikwm/internal/update"
 	"github.com/spf13/cobra"
 )
@@ -45,7 +45,6 @@ func SetVersion(v string) {
 	}
 }
 
-// rootCmd represents the base command when called without any subcommands.
 var rootCmd = &cobra.Command{
 	Use:   "tikwm [command|targets...]",
 	Short: "A downloader for TikTok, powered by tikwm.com.",
@@ -80,14 +79,11 @@ For example:
 
 		// The full setup for commands that need it.
 		if !isLightweightCmd {
-			// Set up global HTTP transport if bind address is specified.
-			if cfg.BindAddress != "" {
-				transport, err := network.NewHTTPTransport(cfg.BindAddress)
-				if err != nil {
-					return err
-				}
-				network.SetGlobalTransport(transport)
+			// Initialize the network manager with IP rotation.
+			if err := network.InitManager(cfg.BindAddress); err != nil {
+				return err
 			}
+
 			targets := getTargets(cfg, console, args)
 			// Check the flag to clean logs or not.
 			cleanLogs, _ := cmd.Flags().GetBool("clean-logs")

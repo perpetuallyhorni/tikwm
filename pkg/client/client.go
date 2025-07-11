@@ -17,6 +17,7 @@ import (
 	tikwm "github.com/perpetuallyhorni/tikwm/internal"
 	"github.com/perpetuallyhorni/tikwm/internal/fs"
 	"github.com/perpetuallyhorni/tikwm/pkg/config"
+	"github.com/perpetuallyhorni/tikwm/pkg/network"
 	"github.com/perpetuallyhorni/tikwm/pkg/storage"
 )
 
@@ -154,7 +155,7 @@ func (c *Client) adoptLocalAsset(post *tikwm.Post, assetType tikwm.AssetType, lo
 
 // DownloadPost downloads a single post by its URL.
 func (c *Client) DownloadPost(ctx context.Context, url string, force bool, logger *log.Logger) error {
-	post, err := tikwm.GetPost(url, true)
+	post, err := c.getPostWithRetry(ctx, &tikwm.Post{Id: url}, noOpProgress, 0, 0)
 	if err != nil {
 		return err
 	}
@@ -747,12 +748,25 @@ func (c *Client) getPostWithRetry(ctx context.Context, post *tikwm.Post, progres
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		default:
-			progressCb(current, total, "Fetching post details for "+post.ID())
-			hdPost, err := tikwm.GetPost(post.ID(), true)
+			id := post.ID()
+			if id == "" && strings.Contains(post.Id, "tiktok.com") {
+				id = post.Id
+			}
+			progressCb(current, total, "Fetching post details for "+id)
+			hdPost, err := tikwm.GetPost(id, true)
+
 			if err != nil {
-				if strings.Contains(err.Error(), "(-1)") || strings.Contains(err.Error(), "Free Api Limit") || strings.Contains(err.Error(), "(429)") {
+				if tikwm.IsDailyRateLimitError(err) {
+					network.MarkCurrentAddressAsExhausted()
+					c.logger.Printf("Daily rate limit hit. Marking current IP as exhausted and retrying with next available IP.")
+					progressCb(current, total, "Daily rate limit hit. Rotating IP...")
+					// The next iteration will automatically use the next IP.
+					continue
+				}
+
+				if strings.Contains(err.Error(), "(-1)") || strings.Contains(err.Error(), "(429)") {
 					if !c.cfg.RetryOn429 {
-						return nil, fmt.Errorf("rate limited fetching post %s, aborting. Enable --retry-on-429 to retry", post.ID())
+						return nil, fmt.Errorf("rate limited fetching post %s, aborting. Enable --retry-on-429 to retry", id)
 					}
 					wait := time.Second * time.Duration(2<<i) // Exponential backoff: 2s, 4s, 8s...
 					progressCb(current, total, fmt.Sprintf("Rate limited. Retrying in %s...", wait))
@@ -876,6 +890,11 @@ func (c *Client) downloadRetrying(ctx context.Context, post *tikwm.Post, assetTy
 
 	url, size, err := c.getURLAndSizeForAsset(post, assetType)
 	if err != nil {
+		if tikwm.IsDailyRateLimitError(err) {
+			network.MarkCurrentAddressAsExhausted()
+			c.logger.Printf("Daily rate limit hit while getting source encode URL. Rotating IP and retrying.")
+			return c.downloadRetrying(ctx, post, assetType, filename, try, err, opt) // Don't increment try count for IP rotation
+		}
 		return c.downloadRetrying(ctx, post, assetType, filename, try+1, err, opt)
 	}
 
@@ -1074,8 +1093,14 @@ func (c *Client) userFeedSinceInternal(ctx context.Context, uniqueID string, cur
 
 	feed, err := tikwm.GetUserFeedRaw(uniqueID, tikwm.MaxUserFeedCount, cursor)
 	if err != nil {
-		// Specific handling for rate limit errors
-		if strings.Contains(err.Error(), "(-1)") || strings.Contains(err.Error(), "Free Api Limit") || strings.Contains(err.Error(), "(429)") {
+		if tikwm.IsDailyRateLimitError(err) {
+			network.MarkCurrentAddressAsExhausted()
+			opt.OnError(fmt.Errorf("daily rate limit hit. Rotating IP and retrying feed from cursor %s", cursor))
+			// Retry the same request. The network manager will use the next available IP.
+			return c.userFeedSinceInternal(ctx, uniqueID, cursor, opt, currentCount)
+		}
+
+		if strings.Contains(err.Error(), "(-1)") || strings.Contains(err.Error(), "(429)") {
 			if c.cfg.RetryOn429 {
 				opt.OnError(fmt.Errorf("rate limited, retrying feed from cursor %s", cursor))
 				select {
