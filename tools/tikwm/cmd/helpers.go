@@ -60,6 +60,12 @@ func applyFlagOverrides(cmd *cobra.Command, cfg *cliconfig.Config) {
 	if cmd.Flag("save-post-title").Changed {
 		cfg.SavePostTitle, _ = cmd.Flags().GetBool("save-post-title")
 	}
+	if cmd.Flag("feed-cache").Changed {
+		cfg.FeedCache, _ = cmd.Flags().GetBool("feed-cache")
+	}
+	if cmd.Flag("feed-cache-ttl").Changed {
+		cfg.FeedCacheTTL, _ = cmd.Flags().GetString("feed-cache-ttl")
+	}
 }
 
 // getTargets retrieves targets from command-line arguments or a targets file.

@@ -17,6 +17,8 @@ type Config struct {
 	DownloadAvatars bool   `koanf:"download_avatars"` // Download user profile avatars.
 	SavePostTitle   bool   `koanf:"save_post_title"`  // Save the post title to a .txt file.
 	FfmpegPath      string `koanf:"ffmpeg_path"`      // Path to the ffmpeg executable.
+	FeedCache       bool   `koanf:"feed_cache"`       // Enable caching of user feeds.
+	FeedCacheTTL    string `koanf:"feed_cache_ttl"`   // Time-to-live for feed cache (e.g., "1h", "30m").
 }
 
 // Default returns the default core configuration.
@@ -40,5 +42,7 @@ func Default() *Config {
 		DownloadAvatars: false,
 		SavePostTitle:   false,
 		FfmpegPath:      "ffmpeg",
+		FeedCache:       true,
+		FeedCacheTTL:    "1h",
 	}
 }
