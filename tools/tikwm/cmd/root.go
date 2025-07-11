@@ -214,6 +214,10 @@ func init() {
 	rootCmd.PersistentFlags().Bool("feed-cache", false, "Enable or disable caching of user feeds. Overrides config.")
 	rootCmd.PersistentFlags().String("feed-cache-ttl", "", `Time-to-live for feed cache, e.g., "1h", "30m". Overrides config.`)
 
+	// Daemon flags
+	rootCmd.PersistentFlags().Bool("daemon", false, "Enable daemon mode for continuous, low-frequency polling. Overrides config.")
+	rootCmd.PersistentFlags().String("daemon-poll-interval", "", `Polling interval for daemon mode, e.g., "60s". Overrides config.`)
+
 	// Add subcommands.
 	rootCmd.AddCommand(downloadCmd)
 	rootCmd.AddCommand(infoCmd)

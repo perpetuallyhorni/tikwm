@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -20,6 +21,8 @@ import (
 	cliconfig "github.com/perpetuallyhorni/tikwm/tools/tikwm/internal/config"
 	"github.com/spf13/cobra"
 )
+
+const markerComment = "# Completed targets are moved below this line. New targets should be added above."
 
 // TargetManager manages the dynamic processing of targets from a file.
 type TargetManager struct {
@@ -62,9 +65,7 @@ func runDownload(cmd *cobra.Command, args []string) error {
 
 	force, _ := cmd.Flags().GetBool("force")
 
-	// If using targets file and it's configured, run with hot-reloading.
-	// Otherwise (e.g. command-line args), run as a one-shot command.
-	if isFromFile && cfg.TargetsFile != "" {
+	if isFromFile && cfg.TargetsFile != "" && cfg.DaemonMode {
 		return runDynamicDownload(force)
 	}
 	return runStaticDownload(force, targets, isFromFile)
@@ -143,8 +144,6 @@ func NewTargetManager(force bool) (*TargetManager, error) {
 // Run starts the main loop of the TargetManager.
 func (tm *TargetManager) Run() error {
 	defer tm.watcher.Close()
-
-	// Watch the parent directory of the targets file for robustness.
 	targetsDir := filepath.Dir(tm.cfg.TargetsFile)
 	if err := os.MkdirAll(targetsDir, 0750); err != nil {
 		return fmt.Errorf("could not create targets directory '%s': %w", targetsDir, err)
@@ -152,46 +151,36 @@ func (tm *TargetManager) Run() error {
 	if err := tm.watcher.Add(targetsDir); err != nil {
 		return fmt.Errorf("could not watch targets directory '%s': %w", targetsDir, err)
 	}
-
+	if err := tm.initializeTargetsFileState(); err != nil {
+		return fmt.Errorf("failed to initialize targets file state: %w", err)
+	}
 	tm.logger.Printf("Starting target manager, watching %s for changes to %s", targetsDir, filepath.Base(tm.cfg.TargetsFile))
-	tm.console.Info("Starting dynamic target manager. Watching '%s' for changes.", tm.cfg.TargetsFile)
-	tm.console.Info("Top %d targets in the file will be processed in parallel.", tm.cfg.MaxWorkers)
-	tm.console.Info("The rest will be queued and processed as workers become available.")
+	tm.console.Info("Starting daemon mode. Watching '%s' for changes.", tm.cfg.TargetsFile)
 	tm.console.Info("Press Ctrl+C to exit.")
-
-	// Start a goroutine to handle worker completions.
 	tm.wg.Add(1)
 	go tm.completionHandler()
-
-	// Initial reconciliation.
 	tm.triggerReconcile()
-
 	for {
 		select {
 		case <-tm.reconcileTrigger:
 			tm.reconcile()
-
 		case event, ok := <-tm.watcher.Events:
 			if !ok {
-				return nil // Watcher closed
+				return nil
 			}
-			// Check if the event is for our specific targets file.
 			if filepath.Clean(event.Name) == filepath.Clean(tm.cfg.TargetsFile) {
-				// We care about writes, creates, and renames (for atomic saves).
 				if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) || event.Has(fsnotify.Rename) {
 					tm.logger.Printf("Detected change in targets file: %s", event.String())
-					time.Sleep(250 * time.Millisecond) // Debounce
+					time.Sleep(250 * time.Millisecond)
 					tm.triggerReconcile()
 				}
 			}
-
 		case err, ok := <-tm.watcher.Errors:
 			if !ok {
 				return nil
 			}
 			tm.logger.Printf("Watcher error: %v", err)
 			tm.console.Warn("File watcher error: %v", err)
-
 		case <-tm.shutdown:
 			tm.logger.Println("Shutdown signal received by manager event loop.")
 			return nil
@@ -202,17 +191,12 @@ func (tm *TargetManager) Run() error {
 // Stop gracefully shuts down the TargetManager.
 func (tm *TargetManager) Stop() {
 	tm.mu.Lock()
-	// Signal shutdown to the main loop and completion handler.
 	close(tm.shutdown)
-
-	// Cancel all active tasks.
 	for target, cancel := range tm.activeTasks {
 		tm.logger.Printf("Cancelling task for target: %s", target)
 		cancel()
 	}
 	tm.mu.Unlock()
-
-	// Wait for all worker goroutines (processing and completion handler) to finish.
 	tm.wg.Wait()
 	tm.logger.Println("All manager goroutines finished.")
 	tm.console.StopRenderer()
@@ -222,7 +206,7 @@ func (tm *TargetManager) Stop() {
 func (tm *TargetManager) triggerReconcile() {
 	select {
 	case tm.reconcileTrigger <- struct{}{}:
-	default: // A reconcile is already pending.
+	default:
 	}
 }
 
@@ -233,7 +217,6 @@ func (tm *TargetManager) completionHandler() {
 		select {
 		case target := <-tm.results:
 			tm.mu.Lock()
-			// Only trigger reconcile if the task was not externally cancelled
 			if _, exists := tm.activeTasks[target]; exists {
 				delete(tm.activeTasks, target)
 				tm.triggerReconcile()
@@ -250,33 +233,36 @@ func (tm *TargetManager) reconcile() {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
-	allTargets := getTargetsFromFile(tm.cfg.TargetsFile, tm.console)
-	priorityTargets := make(map[string]struct{})
-	for i := 0; i < len(allTargets) && i < tm.cfg.MaxWorkers; i++ {
-		priorityTargets[allTargets[i]] = struct{}{}
+	priorityTargets, err := getPriorityTargetsFromFile(tm.cfg.TargetsFile, tm.console)
+	if err != nil {
+		tm.console.Error("Failed to read targets file: %v", err)
+		return
+	}
+	prioritySet := make(map[string]struct{})
+	for _, target := range priorityTargets {
+		prioritySet[target] = struct{}{}
 	}
 
-	// Cancel tasks that are no longer a priority.
 	for target, cancel := range tm.activeTasks {
-		if _, isPriority := priorityTargets[target]; !isPriority {
-			tm.logger.Printf("Target '%s' is no longer a priority target, cancelling.", target)
-			tm.console.Warn("Target '%s' removed or de-prioritized. Stopping task.", target)
+		if _, isPriority := prioritySet[target]; !isPriority {
+			tm.logger.Printf("Target '%s' is no longer a priority, cancelling.", target)
+			tm.console.Warn("Target '%s' processed or de-prioritized. Stopping task.", target)
 			cancel()
 			delete(tm.activeTasks, target)
-			// Remove the task from the console UI immediately for responsiveness.
 			tm.console.RemoveTask(client.ExtractUsername(target))
 			tm.console.RemoveTask("Post " + client.ExtractUsername(target))
 		}
 	}
 
-	// Start new tasks for priority targets that are not already running, if slots are available.
+	if len(priorityTargets) == 0 && len(tm.activeTasks) == 0 {
+		tm.enterDaemonPoll()
+		return
+	}
+
 	activeCount := len(tm.activeTasks)
-	for _, target := range allTargets {
+	for _, target := range priorityTargets {
 		if activeCount >= tm.cfg.MaxWorkers {
-			break // All worker slots are busy.
-		}
-		if _, isPriority := priorityTargets[target]; !isPriority {
-			continue // Not a priority target.
+			break
 		}
 		if _, isActive := tm.activeTasks[target]; !isActive {
 			tm.logger.Printf("New priority target '%s', starting task.", target)
@@ -289,6 +275,28 @@ func (tm *TargetManager) reconcile() {
 	}
 }
 
+func (tm *TargetManager) enterDaemonPoll() {
+	pollInterval, err := time.ParseDuration(tm.cfg.DaemonPollInterval)
+	if err != nil {
+		pollInterval = 60 * time.Second
+		tm.console.Warn("Invalid daemon_poll_interval '%s', using default 60s. Error: %v", tm.cfg.DaemonPollInterval, err)
+	}
+
+	tm.console.Info("All targets processed. Entering low-frequency poll mode (checking every %s).", pollInterval)
+
+	go func() {
+		select {
+		case <-time.After(pollInterval):
+			if err := tm.initializeTargetsFileState(); err != nil {
+				tm.console.Error("Failed to reset targets file for new poll cycle: %v", err)
+			}
+			tm.triggerReconcile()
+		case <-tm.shutdown:
+			return
+		}
+	}()
+}
+
 // processTarget is the goroutine function for a single worker.
 func (tm *TargetManager) processTarget(ctx context.Context, target string) {
 	defer tm.wg.Done()
@@ -296,33 +304,113 @@ func (tm *TargetManager) processTarget(ctx context.Context, target string) {
 	parsed := parseTarget(target)
 	err := processTargetWithContext(ctx, parsed, tm.appClient, tm.logger, tm.console, tm.force)
 
-	// On successful completion (err is nil), manage the targets file.
 	if err == nil {
 		tm.console.Success("Target '%s' finished processing.", target)
 		if strings.TrimSpace(target) != "" {
-			tm.updateTargetsFileOnSuccess(target, parsed.Type)
+			tm.updateTargetsFileOnSuccess(target)
 		}
 	} else if !errors.Is(err, context.Canceled) {
-		// Log errors, but not cancellations.
 		tm.console.Error("Target '%s' finished with an error.", target)
 		tm.logger.Printf("ERROR processing target %s: %v", target, err)
 	}
 
-	// Signal completion to the manager regardless of outcome.
 	select {
 	case tm.results <- target:
 	case <-tm.shutdown:
 	}
 }
 
-// updateTargetsFileOnSuccess handles the file modification logic safely.
-func (tm *TargetManager) updateTargetsFileOnSuccess(target, targetType string) {
+// updateTargetsFileOnSuccess moves a successfully processed user below the marker.
+func (tm *TargetManager) updateTargetsFileOnSuccess(target string) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
-	// Writing to the file will trigger the watcher. This is expected and desired.
-	if err := manageTargetsFile(target, targetType, tm.cfg.TargetsFile, tm.console); err != nil {
+	lines, err := readLines(tm.cfg.TargetsFile)
+	if err != nil {
 		tm.console.Warn("Could not update targets file for '%s': %v", target, err)
-		tm.logger.Printf("WARN: Could not update targets file for '%s': %v", target, err)
+		return
 	}
+	var newLines, completedLines []string
+	var found bool
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == target {
+			completedLines = append(completedLines, line)
+			found = true
+		} else if trimmed != markerComment {
+			newLines = append(newLines, line)
+		}
+	}
+
+	if found {
+		finalContent := strings.Join(newLines, "\n") + "\n" + markerComment + "\n" + strings.Join(completedLines, "\n")
+		// #nosec G306
+		if err := os.WriteFile(tm.cfg.TargetsFile, []byte(finalContent), 0640); err != nil {
+			tm.console.Warn("Failed to write updated targets file: %v", err)
+		}
+	}
+}
+
+// initializeTargetsFileState ensures the marker is at the end of the file.
+func (tm *TargetManager) initializeTargetsFileState() error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	lines, err := readLines(tm.cfg.TargetsFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return os.WriteFile(tm.cfg.TargetsFile, []byte(markerComment+"\n"), 0640) // #nosec G306
+		}
+		return err
+	}
+
+	var regularLines []string
+	for _, line := range lines {
+		if strings.TrimSpace(line) != markerComment {
+			regularLines = append(regularLines, line)
+		}
+	}
+
+	content := strings.Join(regularLines, "\n")
+	if len(regularLines) > 0 {
+		content += "\n"
+	}
+	content += markerComment + "\n"
+
+	// #nosec G306
+	return os.WriteFile(tm.cfg.TargetsFile, []byte(content), 0640)
+}
+
+// getPriorityTargetsFromFile reads targets from the specified file up to the marker.
+func getPriorityTargetsFromFile(filePath string, console *cli.Console) ([]string, error) {
+	lines, err := readLines(filePath)
+	if err != nil {
+		return nil, err
+	}
+	var fileTargets []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == markerComment {
+			break
+		}
+		if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+			fileTargets = append(fileTargets, trimmed)
+		}
+	}
+	return fileTargets, nil
+}
+
+// readLines is a helper to read a file into a slice of strings.
+func readLines(filePath string) ([]string, error) {
+	file, err := os.Open(filePath) // #nosec G304
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	var lines []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	return lines, scanner.Err()
 }

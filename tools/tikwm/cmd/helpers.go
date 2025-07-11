@@ -70,6 +70,12 @@ func applyFlagOverrides(cmd *cobra.Command, cfg *cliconfig.Config) {
 	if cmd.Flag("bind").Changed {
 		cfg.BindAddress, _ = cmd.Flags().GetString("bind")
 	}
+	if cmd.Flag("daemon").Changed {
+		cfg.DaemonMode, _ = cmd.Flags().GetBool("daemon")
+	}
+	if cmd.Flag("daemon-poll-interval").Changed {
+		cfg.DaemonPollInterval, _ = cmd.Flags().GetString("daemon-poll-interval")
+	}
 }
 
 // getTargets retrieves targets from command-line arguments or a targets file.
