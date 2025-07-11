@@ -67,6 +67,9 @@ func applyFlagOverrides(cmd *cobra.Command, cfg *cliconfig.Config) {
 	if cmd.Flag("feed-cache-ttl").Changed {
 		cfg.FeedCacheTTL, _ = cmd.Flags().GetString("feed-cache-ttl")
 	}
+	if cmd.Flag("bind").Changed {
+		cfg.BindAddress, _ = cmd.Flags().GetString("bind")
+	}
 }
 
 // getTargets retrieves targets from command-line arguments or a targets file.

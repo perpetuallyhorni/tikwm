@@ -1,3 +1,4 @@
+// tools/tikwm/internal/config/config.go
 package cliconfig
 
 import (
@@ -132,6 +133,11 @@ retry_on_429: %t
 # Path to the ffmpeg executable. Used to validate downloaded videos.
 ffmpeg_path: "%s"
 
+# Network
+# Specify the local IP address or network interface name for outbound connections.
+# Leave blank to let the OS decide. Examples: "192.168.1.100", "eth0"
+bind_address: "%s"
+
 # Caching
 # Enable caching of user feeds to speed up repeated runs.
 feed_cache: %t
@@ -145,7 +151,7 @@ editor: "%s"
 check_for_updates: %t
 # Automatically install new versions of tikwm. If false, you will be notified to run 'tikwm update'.
 auto_update: %t
-`, cfg.DownloadPath, cfg.TargetsFile, cfg.DatabasePath, cfg.MaxWorkers, cfg.Quality, cfg.Since, cfg.DownloadCovers, cfg.CoverType, cfg.DownloadAvatars, cfg.SavePostTitle, cfg.RetryOn429, cfg.FfmpegPath, cfg.FeedCache, cfg.FeedCacheTTL, cfg.Editor, cfg.CheckForUpdates, cfg.AutoUpdate)
+`, cfg.DownloadPath, cfg.TargetsFile, cfg.DatabasePath, cfg.MaxWorkers, cfg.Quality, cfg.Since, cfg.DownloadCovers, cfg.CoverType, cfg.DownloadAvatars, cfg.SavePostTitle, cfg.RetryOn429, cfg.FfmpegPath, cfg.BindAddress, cfg.FeedCache, cfg.FeedCacheTTL, cfg.Editor, cfg.CheckForUpdates, cfg.AutoUpdate)
 	content = strings.ReplaceAll(content, "\\", "/")
 	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
 		return fmt.Errorf("failed to write default config file: %w", err)

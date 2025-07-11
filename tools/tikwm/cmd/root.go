@@ -12,6 +12,7 @@ import (
 	"github.com/perpetuallyhorni/tikwm/pkg/storage/sqlite"
 	"github.com/perpetuallyhorni/tikwm/tools/tikwm/internal/cli"
 	cliconfig "github.com/perpetuallyhorni/tikwm/tools/tikwm/internal/config"
+	"github.com/perpetuallyhorni/tikwm/tools/tikwm/internal/network"
 	"github.com/perpetuallyhorni/tikwm/tools/tikwm/internal/update"
 	"github.com/spf13/cobra"
 )
@@ -79,6 +80,14 @@ For example:
 
 		// The full setup for commands that need it.
 		if !isLightweightCmd {
+			// Set up global HTTP transport if bind address is specified.
+			if cfg.BindAddress != "" {
+				transport, err := network.NewHTTPTransport(cfg.BindAddress)
+				if err != nil {
+					return err
+				}
+				network.SetGlobalTransport(transport)
+			}
 			targets := getTargets(cfg, console, args)
 			// Check the flag to clean logs or not.
 			cleanLogs, _ := cmd.Flags().GetBool("clean-logs")
@@ -151,7 +160,6 @@ For example:
 	SilenceErrors: true,
 }
 
-// ... rest of root.go is unchanged
 // init initializes the command line interface.
 func init() {
 	// Initialize the console.
@@ -202,6 +210,9 @@ func init() {
 	rootCmd.PersistentFlags().String("cover-type", "", `Cover type to download ("cover", "origin", "dynamic"). Overrides config.`)
 	rootCmd.PersistentFlags().Bool("download-avatars", false, "Enable downloading of user avatars. Overrides config.")
 	rootCmd.PersistentFlags().Bool("save-post-title", false, "Save post title to a .txt file. Overrides config.")
+
+	// Network flags
+	rootCmd.PersistentFlags().String("bind", "", "Outbound IP address or interface to bind to (overrides config)")
 
 	// Caching flags
 	rootCmd.PersistentFlags().Bool("feed-cache", false, "Enable or disable caching of user feeds. Overrides config.")
