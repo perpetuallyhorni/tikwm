@@ -75,7 +75,8 @@ func DownloadAndHash(url, fullPath string) (string, error) {
 	if err != nil {
 		return "", err // Return an error if the request cannot be created.
 	}
-	if resp := DefaultDownloadClient.Do(req); resp.Err() != nil { // Execute the download request.
+	client := GetDownloadClient()
+	if resp := client.Do(req); resp.Err() != nil { // Execute the download request.
 		return "", resp.Err() // Return an error if the download fails.
 	}
 
@@ -121,12 +122,13 @@ func (opt *DownloadOpt) Defaults() *DownloadOpt {
 		ret = &DownloadOpt{}
 	}
 	if ret.DownloadWith == nil {
+		client := GetDownloadClient()
 		ret.DownloadWith = func(url string, filename string) error {
 			req, err := grab.NewRequest(filename, url)
 			if err != nil {
 				return err
 			}
-			if resp := DefaultDownloadClient.Do(req); resp.Err() != nil {
+			if resp := client.Do(req); resp.Err() != nil {
 				return resp.Err()
 			}
 			return nil
@@ -156,20 +158,23 @@ func (opt *DownloadOpt) Defaults() *DownloadOpt {
 	return ret
 }
 
-// DefaultDownloadClient is the default HTTP client for downloading files.
 var (
-	DefaultDownloadClient = &grab.Client{
+	// DefaultTimeout is the default timeout for requests.
+	DefaultTimeout = time.Millisecond * 100
+	// DefaultTimeoutOnError is the default timeout between retries on error.
+	DefaultTimeoutOnError = time.Second * 10
+)
+
+// GetDownloadClient returns a grab.Client that uses the globally configured http.Client.
+func GetDownloadClient() *grab.Client {
+	return &grab.Client{
 		HTTPClient: &http.Client{
-			Transport: &http.Transport{
-				Proxy: http.ProxyFromEnvironment,
-			},
-			Timeout: time.Minute * 5,
+			Transport: http.DefaultClient.Transport, // Use the globally configured transport
+			Timeout:   time.Minute * 5,
 		},
 		UserAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.1",
 	}
-	DefaultTimeout        = time.Millisecond * 100 // Default timeout for requests.
-	DefaultTimeoutOnError = time.Second * 10       // Default timeout between retries on error.
-)
+}
 
 // IsAlbum returns true if the post is an album (has images).
 func (post Post) IsAlbum() bool {

@@ -19,6 +19,7 @@ type Config struct {
 	FfmpegPath      string `koanf:"ffmpeg_path"`      // Path to the ffmpeg executable.
 	FeedCache       bool   `koanf:"feed_cache"`       // Enable caching of user feeds.
 	FeedCacheTTL    string `koanf:"feed_cache_ttl"`   // Time-to-live for feed cache (e.g., "1h", "30m").
+	BindAddress     string `koanf:"bind_address"`     // Outbound IP address or interface to bind to.
 }
 
 // Default returns the default core configuration.
@@ -44,5 +45,6 @@ func Default() *Config {
 		FfmpegPath:      "ffmpeg",
 		FeedCache:       true,
 		FeedCacheTTL:    "1h",
+		BindAddress:     "", // Default is to let the OS decide.
 	}
 }

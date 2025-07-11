@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	tikwm "github.com/perpetuallyhorni/tikwm/internal"
 	"github.com/perpetuallyhorni/tikwm/internal/fs"
 	"github.com/perpetuallyhorni/tikwm/pkg/config"
+	"github.com/perpetuallyhorni/tikwm/pkg/network"
 	"github.com/perpetuallyhorni/tikwm/pkg/storage"
 )
 
@@ -152,8 +154,8 @@ func (c *Client) adoptLocalAsset(post *tikwm.Post, assetType tikwm.AssetType, lo
 }
 
 // DownloadPost downloads a single post by its URL.
-func (c *Client) DownloadPost(url string, force bool, logger *log.Logger) error {
-	post, err := tikwm.GetPost(url, true)
+func (c *Client) DownloadPost(ctx context.Context, url string, force bool, logger *log.Logger) error {
+	post, err := c.getPostWithRetry(ctx, &tikwm.Post{Id: url}, noOpProgress, 0, 0)
 	if err != nil {
 		return err
 	}
@@ -164,7 +166,7 @@ func (c *Client) DownloadPost(url string, force bool, logger *log.Logger) error 
 			return err
 		}
 		for _, assetType := range qualities {
-			if err := c.ensureVideoAsset(post, assetType, force, logger); err != nil {
+			if err := c.ensureVideoAsset(ctx, post, assetType, force, logger); err != nil {
 				logger.Printf("Could not process video for post %s (quality: %s): %v", post.ID(), assetType, err)
 				if errors.Is(err, tikwm.ErrDiskSpace) {
 					return err // Propagate fatal error
@@ -172,7 +174,7 @@ func (c *Client) DownloadPost(url string, force bool, logger *log.Logger) error 
 			}
 		}
 	} else if post.IsAlbum() {
-		if err := c.ensureAlbum(post, force, logger); err != nil {
+		if err := c.ensureAlbum(ctx, post, force, logger); err != nil {
 			logger.Printf("Could not process album for post %s: %v", post.ID(), err)
 			if errors.Is(err, tikwm.ErrDiskSpace) {
 				return err // Propagate fatal error
@@ -181,7 +183,7 @@ func (c *Client) DownloadPost(url string, force bool, logger *log.Logger) error 
 	}
 
 	if c.cfg.DownloadCovers {
-		if err := c.ensureCoverAsset(post, force, logger); err != nil {
+		if err := c.ensureCoverAsset(ctx, post, force, logger); err != nil {
 			logger.Printf("Could not download cover for post %s: %v", post.ID(), err)
 			if errors.Is(err, tikwm.ErrDiskSpace) {
 				return err // Propagate fatal error
@@ -189,7 +191,7 @@ func (c *Client) DownloadPost(url string, force bool, logger *log.Logger) error 
 		}
 	}
 	if c.cfg.DownloadAvatars {
-		if err := c.ensureAvatar(post, force, logger, make(map[string]bool)); err != nil {
+		if err := c.ensureAvatar(ctx, post, force, logger, make(map[string]bool)); err != nil {
 			logger.Printf("Could not download avatar for post %s: %v", post.Author.UniqueId, err)
 			if errors.Is(err, tikwm.ErrDiskSpace) {
 				return err // Propagate fatal error
@@ -200,7 +202,7 @@ func (c *Client) DownloadPost(url string, force bool, logger *log.Logger) error 
 }
 
 // DownloadProfile orchestrates the download of a user's entire profile with optimizations.
-func (c *Client) DownloadProfile(username string, force bool, logger *log.Logger, progressCb ProgressCallback) error {
+func (c *Client) DownloadProfile(ctx context.Context, username string, force bool, logger *log.Logger, progressCb ProgressCallback) error {
 	if progressCb == nil {
 		progressCb = noOpProgress
 	}
@@ -224,7 +226,7 @@ func (c *Client) DownloadProfile(username string, force bool, logger *log.Logger
 			progressCb(count, 0, fmt.Sprintf("%d posts found", count))
 		},
 	}
-	postChan, expectedCount, err := c.getUserFeed(username, feedOpt)
+	postChan, expectedCount, err := c.getUserFeed(ctx, username, feedOpt)
 	if err != nil {
 		return err
 	}
@@ -235,51 +237,67 @@ func (c *Client) DownloadProfile(username string, force bool, logger *log.Logger
 	}
 
 	i := 0
-	for postFromFeed := range postChan {
-		i++
-		postID := postFromFeed.ID()
-		progressCb(i, expectedCount, fmt.Sprintf("Checking %s", postID))
-		logger.Printf("--- Checking post %s (%d/%d) ---", postID, i, expectedCount)
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Printf("Profile download for %s cancelled.", username)
+			break loop
+		case postFromFeed, ok := <-postChan:
+			if !ok {
+				break loop // Channel closed, normal exit
+			}
+			i++
+			postID := postFromFeed.ID()
+			progressCb(i, expectedCount, fmt.Sprintf("Checking %s", postID))
+			logger.Printf("--- Checking post %s (%d/%d) ---", postID, i, expectedCount)
 
-		var procErr error
-		if postFromFeed.IsAlbum() {
-			procErr = c.processAlbumInFeed(&postFromFeed, force, logger, progressCb, i, expectedCount)
-		} else { // Is a video
-			procErr = c.processVideoInFeed(&postFromFeed, qualitiesNeeded, force, logger)
-		}
-		if procErr != nil {
-			if errors.Is(procErr, tikwm.ErrDiskSpace) {
-				return procErr // Abort profile download on fatal error
+			var procErr error
+			if postFromFeed.IsAlbum() {
+				procErr = c.processAlbumInFeed(ctx, &postFromFeed, force, logger, progressCb, i, expectedCount)
+			} else { // Is a video
+				procErr = c.processVideoInFeed(ctx, &postFromFeed, qualitiesNeeded, force, logger)
 			}
-			logger.Printf("Error processing post %s: %v. Continuing...", postID, procErr)
-		}
+			if procErr != nil {
+				if errors.Is(procErr, tikwm.ErrDiskSpace) || errors.Is(procErr, context.Canceled) {
+					return procErr // Abort profile download on fatal error
+				}
+				logger.Printf("Error processing post %s: %v. Continuing...", postID, procErr)
+			}
 
-		// Process cover for all post types
-		if c.cfg.DownloadCovers {
-			if err := c.processCoverInFeed(&postFromFeed, force, logger); err != nil {
-				if errors.Is(err, tikwm.ErrDiskSpace) {
-					return err // Abort profile download on fatal error
+			// Process cover for all post types
+			if c.cfg.DownloadCovers {
+				if err := c.processCoverInFeed(ctx, &postFromFeed, force, logger); err != nil {
+					if errors.Is(err, tikwm.ErrDiskSpace) || errors.Is(err, context.Canceled) {
+						return err // Abort profile download on fatal error
+					}
+					logger.Printf("Error processing cover for post %s: %v. Continuing...", postID, err)
 				}
-				logger.Printf("Error processing cover for post %s: %v. Continuing...", postID, err)
+			}
+			// Process avatar once per author per run
+			if c.cfg.DownloadAvatars {
+				if err := c.ensureAvatar(ctx, &postFromFeed, force, logger, processedAvatars); err != nil {
+					if errors.Is(err, tikwm.ErrDiskSpace) || errors.Is(err, context.Canceled) {
+						return err // Abort profile download on fatal error
+					}
+					// Log non-fatal avatar errors but continue
+					logger.Printf("Could not download avatar for %s: %v", postFromFeed.Author.UniqueId, err)
+				}
 			}
 		}
-		// Process avatar once per author per run
-		if c.cfg.DownloadAvatars {
-			if err := c.ensureAvatar(&postFromFeed, force, logger, processedAvatars); err != nil {
-				if errors.Is(err, tikwm.ErrDiskSpace) {
-					return err // Abort profile download on fatal error
-				}
-				// Log non-fatal avatar errors but continue
-				logger.Printf("Could not download avatar for %s: %v", postFromFeed.Author.UniqueId, err)
-			}
-		}
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 	progressCb(expectedCount, expectedCount, "Profile processing complete.")
 	return nil
 }
 
 // ensureAvatar handles downloading a user's avatar if it's new.
-func (c *Client) ensureAvatar(post *tikwm.Post, force bool, logger *log.Logger, processed map[string]bool) error {
+func (c *Client) ensureAvatar(ctx context.Context, post *tikwm.Post, force bool, logger *log.Logger, processed map[string]bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	authorID := post.Author.UniqueId
 	if _, ok := processed[authorID]; ok {
 		return nil // Already handled this author in this session
@@ -359,21 +377,21 @@ func (c *Client) savePostTitle(post *tikwm.Post, logger *log.Logger) error {
 }
 
 // processVideoInFeed handles video-specific processing within the feed.
-func (c *Client) processVideoInFeed(postFromFeed *tikwm.Post, qualitiesNeeded []tikwm.AssetType, force bool, logger *log.Logger) error {
+func (c *Client) processVideoInFeed(ctx context.Context, postFromFeed *tikwm.Post, qualitiesNeeded []tikwm.AssetType, force bool, logger *log.Logger) error {
 	postID := postFromFeed.ID()
 	validator := tikwm.ValidateWithFfmpeg(c.cfg.FfmpegPath)
 
 	if force {
 		logger.Printf("Force enabled for %s. Fetching full details to download all qualities.", postID)
-		fullPost, err := c.getPostWithRetry(postFromFeed, noOpProgress, 0, 0)
+		fullPost, err := c.getPostWithRetry(ctx, postFromFeed, noOpProgress, 0, 0)
 		if err != nil {
 			logger.Printf("Failed to get full post details for %s: %v", postID, err)
-			return nil // Continue with other posts
+			return err
 		}
 		for _, quality := range qualitiesNeeded {
-			if err := c.ensureVideoAsset(fullPost, quality, true, logger); err != nil {
+			if err := c.ensureVideoAsset(ctx, fullPost, quality, true, logger); err != nil {
 				logger.Printf("Error during forced download for %s (quality: %s): %v", postID, quality, err)
-				if errors.Is(err, tikwm.ErrDiskSpace) {
+				if errors.Is(err, tikwm.ErrDiskSpace) || errors.Is(err, context.Canceled) {
 					return err
 				}
 			}
@@ -382,6 +400,9 @@ func (c *Client) processVideoInFeed(postFromFeed *tikwm.Post, qualitiesNeeded []
 	}
 
 	for _, quality := range qualitiesNeeded {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if exists, _ := c.db.AssetExists(postID, quality); exists {
 			continue
 		}
@@ -389,9 +410,9 @@ func (c *Client) processVideoInFeed(postFromFeed *tikwm.Post, qualitiesNeeded []
 		exists, size, err := c.checkLocalAsset(postFromFeed, quality, logger)
 		if err != nil {
 			logger.Printf("Error checking local asset for %s (quality: %s): %v. Will attempt download.", postID, quality, err)
-			if err := c.ensureVideoAsset(postFromFeed, quality, true, logger); err != nil {
+			if err := c.ensureVideoAsset(ctx, postFromFeed, quality, true, logger); err != nil {
 				logger.Printf("Error downloading video for %s: %v", postID, err)
-				if errors.Is(err, tikwm.ErrDiskSpace) {
+				if errors.Is(err, tikwm.ErrDiskSpace) || errors.Is(err, context.Canceled) {
 					return err
 				}
 			}
@@ -400,9 +421,9 @@ func (c *Client) processVideoInFeed(postFromFeed *tikwm.Post, qualitiesNeeded []
 
 		if !exists {
 			logger.Printf("Asset for %s (quality: %s) not found. Downloading.", postID, quality)
-			if err := c.ensureVideoAsset(postFromFeed, quality, true, logger); err != nil {
+			if err := c.ensureVideoAsset(ctx, postFromFeed, quality, true, logger); err != nil {
 				logger.Printf("Error downloading video for %s: %v", postID, err)
-				if errors.Is(err, tikwm.ErrDiskSpace) {
+				if errors.Is(err, tikwm.ErrDiskSpace) || errors.Is(err, context.Canceled) {
 					return err
 				}
 			}
@@ -440,9 +461,9 @@ func (c *Client) processVideoInFeed(postFromFeed *tikwm.Post, qualitiesNeeded []
 			}
 		} else {
 			// If we decided not to adopt for any reason (bad size, failed validation), re-download.
-			if err := c.ensureVideoAsset(postFromFeed, quality, true, logger); err != nil {
+			if err := c.ensureVideoAsset(ctx, postFromFeed, quality, true, logger); err != nil {
 				logger.Printf("Error re-downloading video for %s: %v", postID, err)
-				if errors.Is(err, tikwm.ErrDiskSpace) {
+				if errors.Is(err, tikwm.ErrDiskSpace) || errors.Is(err, context.Canceled) {
 					return err
 				}
 			}
@@ -452,7 +473,7 @@ func (c *Client) processVideoInFeed(postFromFeed *tikwm.Post, qualitiesNeeded []
 }
 
 // ensureVideoAsset handles the logic for making sure a video asset exists on disk and is recorded in the database.
-func (c *Client) ensureVideoAsset(post *tikwm.Post, assetType tikwm.AssetType, force bool, logger *log.Logger) error {
+func (c *Client) ensureVideoAsset(ctx context.Context, post *tikwm.Post, assetType tikwm.AssetType, force bool, logger *log.Logger) error {
 	if !force {
 		exists, err := c.db.AssetExists(post.ID(), assetType)
 		if err != nil {
@@ -465,7 +486,7 @@ func (c *Client) ensureVideoAsset(post *tikwm.Post, assetType tikwm.AssetType, f
 	}
 	logger.Printf("Processing video asset for post %s (quality: %s)...", post.ID(), assetType)
 
-	_, sha, err := c.downloadVideo(post, assetType, tikwm.DownloadOpt{Directory: c.cfg.DownloadPath, FfmpegPath: c.cfg.FfmpegPath})
+	_, sha, err := c.downloadVideo(ctx, post, assetType, tikwm.DownloadOpt{Directory: c.cfg.DownloadPath, FfmpegPath: c.cfg.FfmpegPath})
 	if err != nil {
 		return err
 	}
@@ -480,7 +501,7 @@ func (c *Client) ensureVideoAsset(post *tikwm.Post, assetType tikwm.AssetType, f
 	return c.savePostTitle(post, logger)
 }
 
-func (c *Client) ensureCoverAsset(post *tikwm.Post, force bool, logger *log.Logger) error {
+func (c *Client) ensureCoverAsset(ctx context.Context, post *tikwm.Post, force bool, logger *log.Logger) error {
 	assetType, coverURL := c.getCoverAssetType(post)
 	if coverURL == "" {
 		return fmt.Errorf("no URL found for configured cover type '%s' on post %s", c.cfg.CoverType, post.ID())
@@ -512,20 +533,20 @@ func (c *Client) ensureCoverAsset(post *tikwm.Post, force bool, logger *log.Logg
 	return c.db.AddOrUpdateAsset(post.ID(), post.Author.UniqueId, post.CreateTime, assetType, sha)
 }
 
-func (c *Client) processCoverInFeed(post *tikwm.Post, force bool, logger *log.Logger) error {
+func (c *Client) processCoverInFeed(ctx context.Context, post *tikwm.Post, force bool, logger *log.Logger) error {
 	if !c.cfg.DownloadCovers {
 		return nil
 	}
-	if err := c.ensureCoverAsset(post, force, logger); err != nil {
+	if err := c.ensureCoverAsset(ctx, post, force, logger); err != nil {
 		logger.Printf("Could not process cover for post %s: %v", post.ID(), err)
-		if errors.Is(err, tikwm.ErrDiskSpace) {
+		if errors.Is(err, tikwm.ErrDiskSpace) || errors.Is(err, context.Canceled) {
 			return err
 		}
 	}
 	return nil
 }
 
-func (c *Client) processAlbumInFeed(post *tikwm.Post, force bool, logger *log.Logger, progressCb ProgressCallback, current, total int) error {
+func (c *Client) processAlbumInFeed(ctx context.Context, post *tikwm.Post, force bool, logger *log.Logger, progressCb ProgressCallback, current, total int) error {
 	postID := post.ID()
 	totalPhotosInAlbum := len(post.Images)
 	if totalPhotosInAlbum == 0 {
@@ -537,7 +558,7 @@ func (c *Client) processAlbumInFeed(post *tikwm.Post, force bool, logger *log.Lo
 		countInDb, err := c.db.GetAlbumPhotoCount(postID)
 		if err != nil {
 			logger.Printf("DB check failed for album %s: %v", postID, err)
-			return nil // Continue with other posts
+			return err // Continue with other posts
 		}
 		if countInDb >= totalPhotosInAlbum {
 			progressCb(current, total, fmt.Sprintf("Album %s complete", postID))
@@ -548,10 +569,10 @@ func (c *Client) processAlbumInFeed(post *tikwm.Post, force bool, logger *log.Lo
 
 	// Album needs processing. Fetch full details to ensure data is fresh.
 	logger.Printf("Album %s requires processing. Fetching full post details.", postID)
-	finalPost, fetchErr := c.getPostWithRetry(post, progressCb, current, total)
+	finalPost, fetchErr := c.getPostWithRetry(ctx, post, progressCb, current, total)
 	if fetchErr != nil {
 		logger.Printf("Failed to get full post details for %s: %v", postID, fetchErr)
-		return nil // Continue with other posts
+		return fetchErr
 	}
 
 	if !finalPost.IsAlbum() || len(finalPost.Images) == 0 {
@@ -559,9 +580,9 @@ func (c *Client) processAlbumInFeed(post *tikwm.Post, force bool, logger *log.Lo
 		return nil
 	}
 
-	if err := c.ensureAlbum(finalPost, force, logger); err != nil {
+	if err := c.ensureAlbum(ctx, finalPost, force, logger); err != nil {
 		logger.Printf("Error processing album for post %s: %v", postID, err)
-		if errors.Is(err, tikwm.ErrDiskSpace) {
+		if errors.Is(err, tikwm.ErrDiskSpace) || errors.Is(err, context.Canceled) {
 			return err
 		}
 	}
@@ -569,7 +590,7 @@ func (c *Client) processAlbumInFeed(post *tikwm.Post, force bool, logger *log.Lo
 }
 
 // ensureAlbum handles the logic for downloading all photos in an album and recording them in the database.
-func (c *Client) ensureAlbum(post *tikwm.Post, force bool, logger *log.Logger) error {
+func (c *Client) ensureAlbum(ctx context.Context, post *tikwm.Post, force bool, logger *log.Logger) error {
 	logger.Printf("Processing album for post %s (%d images)...", post.ID(), len(post.Images))
 
 	// Migration: Delete old single-row entry for this album if it exists.
@@ -582,6 +603,10 @@ func (c *Client) ensureAlbum(post *tikwm.Post, force bool, logger *log.Logger) e
 		photoIndex := i   // 0-based for array access
 		photoNum := i + 1 // 1-based for ID
 		albumPhotoID := fmt.Sprintf("%s_%d_%d", post.ID(), photoNum, len(post.Images))
+
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 
 		if !force {
 			exists, err := c.db.AssetExists(albumPhotoID, tikwm.AssetAlbumPhoto)
@@ -597,10 +622,10 @@ func (c *Client) ensureAlbum(post *tikwm.Post, force bool, logger *log.Logger) e
 
 		logger.Printf("Processing photo %d/%d for post %s.", photoNum, len(post.Images), post.ID())
 
-		_, sha, err := c.downloadAlbumPhoto(post, photoIndex, tikwm.DownloadOpt{Directory: c.cfg.DownloadPath})
+		_, sha, err := c.downloadAlbumPhoto(ctx, post, photoIndex, tikwm.DownloadOpt{Directory: c.cfg.DownloadPath})
 		if err != nil {
 			logger.Printf("Failed to download photo %s: %v", albumPhotoID, err)
-			if errors.Is(err, tikwm.ErrDiskSpace) {
+			if errors.Is(err, tikwm.ErrDiskSpace) || errors.Is(err, context.Canceled) {
 				return err // Propagate fatal error
 			}
 			continue
@@ -622,7 +647,7 @@ func (c *Client) ensureAlbum(post *tikwm.Post, force bool, logger *log.Logger) e
 }
 
 // DownloadCoversForUser downloads missing covers for all posts by a user.
-func (c *Client) DownloadCoversForUser(username string, logger *log.Logger, progressCb ProgressCallback) error {
+func (c *Client) DownloadCoversForUser(ctx context.Context, username string, logger *log.Logger, progressCb ProgressCallback) error {
 	if progressCb == nil {
 		progressCb = noOpProgress
 	}
@@ -636,23 +661,31 @@ func (c *Client) DownloadCoversForUser(username string, logger *log.Logger, prog
 		return nil
 	}
 	for i, record := range posts {
-		progressCb(i+1, len(posts), "Checking post "+record.ID)
-		if record.HasCover {
-			continue
-		}
-		// Album photo entries have composite IDs and won't be processed here, which is correct.
-		if strings.Contains(record.ID, "_") {
-			continue
-		}
-		post, err := c.getPostWithRetry(&tikwm.Post{Id: record.ID}, progressCb, i+1, len(posts))
-		if err != nil {
-			logger.Printf("Could not get post details for %s: %v", record.ID, err)
-			continue
-		}
-		if err := c.ensureCoverAsset(post, false, logger); err != nil {
-			logger.Printf("Could not download cover for post %s: %v", post.ID(), err)
-			if errors.Is(err, tikwm.ErrDiskSpace) {
-				return err
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			progressCb(i+1, len(posts), "Checking post "+record.ID)
+			if record.HasCover {
+				continue
+			}
+			// Album photo entries have composite IDs and won't be processed here, which is correct.
+			if strings.Contains(record.ID, "_") {
+				continue
+			}
+			post, err := c.getPostWithRetry(ctx, &tikwm.Post{Id: record.ID}, progressCb, i+1, len(posts))
+			if err != nil {
+				logger.Printf("Could not get post details for %s: %v", record.ID, err)
+				if errors.Is(err, context.Canceled) {
+					return err
+				}
+				continue
+			}
+			if err := c.ensureCoverAsset(ctx, post, false, logger); err != nil {
+				logger.Printf("Could not download cover for post %s: %v", post.ID(), err)
+				if errors.Is(err, tikwm.ErrDiskSpace) || errors.Is(err, context.Canceled) {
+					return err
+				}
 			}
 		}
 	}
@@ -660,7 +693,7 @@ func (c *Client) DownloadCoversForUser(username string, logger *log.Logger, prog
 }
 
 // FixProfile downloads videos for a user that are present in the database but are missing the desired asset.
-func (c *Client) FixProfile(username string, logger *log.Logger, progressCb ProgressCallback) error {
+func (c *Client) FixProfile(ctx context.Context, username string, logger *log.Logger, progressCb ProgressCallback) error {
 	if progressCb == nil {
 		progressCb = noOpProgress
 	}
@@ -680,16 +713,24 @@ func (c *Client) FixProfile(username string, logger *log.Logger, progressCb Prog
 		}
 		progressCb(0, len(missingPosts), fmt.Sprintf("Found %d missing %s videos.", len(missingPosts), assetType))
 		for i, record := range missingPosts {
-			progressCb(i+1, len(missingPosts), "Processing "+record.ID)
-			post, err := c.getPostWithRetry(&tikwm.Post{Id: record.ID}, progressCb, i+1, len(missingPosts))
-			if err != nil {
-				logger.Printf("Could not get post details for %s: %v", record.ID, err)
-				continue
-			}
-			if err := c.ensureVideoAsset(post, assetType, true, logger); err != nil {
-				logger.Printf("Failed to process video for post %s (quality: %s): %v", post.ID(), assetType, err)
-				if errors.Is(err, tikwm.ErrDiskSpace) {
-					return err
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				progressCb(i+1, len(missingPosts), "Processing "+record.ID)
+				post, err := c.getPostWithRetry(ctx, &tikwm.Post{Id: record.ID}, progressCb, i+1, len(missingPosts))
+				if err != nil {
+					logger.Printf("Could not get post details for %s: %v", record.ID, err)
+					if errors.Is(err, context.Canceled) {
+						return err
+					}
+					continue
+				}
+				if err := c.ensureVideoAsset(ctx, post, assetType, true, logger); err != nil {
+					logger.Printf("Failed to process video for post %s (quality: %s): %v", post.ID(), assetType, err)
+					if errors.Is(err, tikwm.ErrDiskSpace) || errors.Is(err, context.Canceled) {
+						return err
+					}
 				}
 			}
 		}
@@ -697,27 +738,49 @@ func (c *Client) FixProfile(username string, logger *log.Logger, progressCb Prog
 	return nil
 }
 
-func (c *Client) getPostWithRetry(post *tikwm.Post, progressCb ProgressCallback, current, total int) (*tikwm.Post, error) {
+func (c *Client) getPostWithRetry(ctx context.Context, post *tikwm.Post, progressCb ProgressCallback, current, total int) (*tikwm.Post, error) {
 	if progressCb == nil {
 		progressCb = noOpProgress
 	}
 	maxRetries := 5
 	for i := 0; i < maxRetries; i++ {
-		progressCb(current, total, "Fetching post details for "+post.ID())
-		hdPost, err := tikwm.GetPost(post.ID(), true)
-		if err != nil {
-			if strings.Contains(err.Error(), "(-1)") || strings.Contains(err.Error(), "Free Api Limit") || strings.Contains(err.Error(), "(429)") {
-				if !c.cfg.RetryOn429 {
-					return nil, fmt.Errorf("rate limited fetching post %s, aborting. Enable --retry-on-429 to retry", post.ID())
-				}
-				wait := time.Second * time.Duration(2<<i) // Exponential backoff: 2s, 4s, 8s...
-				progressCb(current, total, fmt.Sprintf("Rate limited. Retrying in %s...", wait))
-				time.Sleep(wait)
-				continue
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+			id := post.ID()
+			if id == "" && strings.Contains(post.Id, "tiktok.com") {
+				id = post.Id
 			}
-			return nil, err
+			progressCb(current, total, "Fetching post details for "+id)
+			hdPost, err := tikwm.GetPost(id, true)
+
+			if err != nil {
+				if tikwm.IsDailyRateLimitError(err) {
+					network.MarkCurrentAddressAsExhausted()
+					c.logger.Printf("Daily rate limit hit. Marking current IP as exhausted and retrying with next available IP.")
+					progressCb(current, total, "Daily rate limit hit. Rotating IP...")
+					// The next iteration will automatically use the next IP.
+					continue
+				}
+
+				if strings.Contains(err.Error(), "(-1)") || strings.Contains(err.Error(), "(429)") {
+					if !c.cfg.RetryOn429 {
+						return nil, fmt.Errorf("rate limited fetching post %s, aborting. Enable --retry-on-429 to retry", id)
+					}
+					wait := time.Second * time.Duration(2<<i) // Exponential backoff: 2s, 4s, 8s...
+					progressCb(current, total, fmt.Sprintf("Rate limited. Retrying in %s...", wait))
+					select {
+					case <-time.After(wait):
+						continue
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					}
+				}
+				return nil, err
+			}
+			return hdPost, nil
 		}
-		return hdPost, nil
 	}
 	return nil, fmt.Errorf("failed to get details for %s after %d retries", post.ID(), maxRetries)
 }
@@ -725,7 +788,7 @@ func (c *Client) getPostWithRetry(post *tikwm.Post, progressCb ProgressCallback,
 // --- New Download Logic ---
 
 // downloadVideo downloads a specific quality of a video post.
-func (c *Client) downloadVideo(post *tikwm.Post, assetType tikwm.AssetType, opts ...tikwm.DownloadOpt) (file string, sha256 string, err error) {
+func (c *Client) downloadVideo(ctx context.Context, post *tikwm.Post, assetType tikwm.AssetType, opts ...tikwm.DownloadOpt) (file string, sha256 string, err error) {
 	switch assetType {
 	case tikwm.AssetHD, tikwm.AssetSD, tikwm.AssetSource:
 		// Valid types
@@ -746,7 +809,7 @@ func (c *Client) downloadVideo(post *tikwm.Post, assetType tikwm.AssetType, opts
 	}
 
 	filename := path.Join(creatorDir, opt.FilenameFormat(post, 0, assetType))
-	if err := c.downloadRetrying(post, assetType, filename, 0, nil, opt); err != nil {
+	if err := c.downloadRetrying(ctx, post, assetType, filename, 0, nil, opt); err != nil {
 		return "", "", err
 	}
 	hash, err := tikwm.FileSHA256(filename)
@@ -758,7 +821,7 @@ func (c *Client) downloadVideo(post *tikwm.Post, assetType tikwm.AssetType, opts
 }
 
 // downloadAlbumPhoto downloads a single photo from an album post at a specific index.
-func (c *Client) downloadAlbumPhoto(post *tikwm.Post, index int, opts ...tikwm.DownloadOpt) (file string, sha256 string, err error) {
+func (c *Client) downloadAlbumPhoto(ctx context.Context, post *tikwm.Post, index int, opts ...tikwm.DownloadOpt) (file string, sha256 string, err error) {
 	if !post.IsAlbum() {
 		return "", "", fmt.Errorf("post %s is not an album", post.ID())
 	}
@@ -784,7 +847,7 @@ func (c *Client) downloadAlbumPhoto(post *tikwm.Post, index int, opts ...tikwm.D
 	// Create a copy of the post for the retry logic to avoid race conditions if used concurrently.
 	imgPost := *post
 	// Pass the direct URL as a temporary "AssetType" for the retry logic.
-	if err := c.downloadRetrying(&imgPost, tikwm.AssetType(url), filename, 0, nil, opt); err != nil {
+	if err := c.downloadRetrying(ctx, &imgPost, tikwm.AssetType(url), filename, 0, nil, opt); err != nil {
 		return "", "", err
 	}
 
@@ -797,7 +860,10 @@ func (c *Client) downloadAlbumPhoto(post *tikwm.Post, index int, opts ...tikwm.D
 }
 
 // downloadRetrying attempts to download a file with retries and post refresh on failures.
-func (c *Client) downloadRetrying(post *tikwm.Post, assetType tikwm.AssetType, filename string, try int, lastErr error, opt *tikwm.DownloadOpt) error {
+func (c *Client) downloadRetrying(ctx context.Context, post *tikwm.Post, assetType tikwm.AssetType, filename string, try int, lastErr error, opt *tikwm.DownloadOpt) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if try > opt.Retries {
 		finalErr := lastErr
 		if finalErr == nil {
@@ -807,11 +873,16 @@ func (c *Client) downloadRetrying(post *tikwm.Post, assetType tikwm.AssetType, f
 	}
 
 	if try > 0 {
-		time.Sleep(opt.TimeoutOnError)
+		select {
+		case <-time.After(opt.TimeoutOnError):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
 		if assetType == tikwm.AssetHD || assetType == tikwm.AssetSD {
-			refreshedPost, refreshErr := c.getPostWithRetry(post, nil, 0, 0) // No progress CB for internal retries
+			refreshedPost, refreshErr := c.getPostWithRetry(ctx, post, nil, 0, 0) // No progress CB for internal retries
 			if refreshErr != nil {
-				return c.downloadRetrying(post, assetType, filename, try+1, refreshErr, opt)
+				return c.downloadRetrying(ctx, post, assetType, filename, try+1, refreshErr, opt)
 			}
 			*post = *refreshedPost
 		}
@@ -819,7 +890,12 @@ func (c *Client) downloadRetrying(post *tikwm.Post, assetType tikwm.AssetType, f
 
 	url, size, err := c.getURLAndSizeForAsset(post, assetType)
 	if err != nil {
-		return c.downloadRetrying(post, assetType, filename, try+1, err, opt)
+		if tikwm.IsDailyRateLimitError(err) {
+			network.MarkCurrentAddressAsExhausted()
+			c.logger.Printf("Daily rate limit hit while getting source encode URL. Rotating IP and retrying.")
+			return c.downloadRetrying(ctx, post, assetType, filename, try, err, opt) // Don't increment try count for IP rotation
+		}
+		return c.downloadRetrying(ctx, post, assetType, filename, try+1, err, opt)
 	}
 
 	requiredSpace := uint64(0)
@@ -838,18 +914,18 @@ func (c *Client) downloadRetrying(post *tikwm.Post, assetType tikwm.AssetType, f
 	}
 
 	if url == "" {
-		return c.downloadRetrying(post, assetType, filename, try+1, fmt.Errorf("URL for asset type %s is missing", assetType), opt)
+		return c.downloadRetrying(ctx, post, assetType, filename, try+1, fmt.Errorf("URL for asset type %s is missing", assetType), opt)
 	}
 
 	if err := opt.DownloadWith(url, filename); err != nil {
-		return c.downloadRetrying(post, assetType, filename, try+1, err, opt)
+		return c.downloadRetrying(ctx, post, assetType, filename, try+1, err, opt)
 	}
 
 	if post.IsVideo() {
 		if valid, err := opt.ValidateWith(filename); err != nil {
-			return c.downloadRetrying(post, assetType, filename, try+1, err, opt)
+			return c.downloadRetrying(ctx, post, assetType, filename, try+1, err, opt)
 		} else if !valid {
-			return c.downloadRetrying(post, assetType, filename, try+1, fmt.Errorf("validation failed for %s", filename), opt)
+			return c.downloadRetrying(ctx, post, assetType, filename, try+1, fmt.Errorf("validation failed for %s", filename), opt)
 		}
 	}
 	return nil
@@ -881,7 +957,7 @@ func (c *Client) getURLAndSizeForAsset(post *tikwm.Post, assetType tikwm.AssetTy
 
 // getUserFeed fetches the user feed and returns a channel to which posts are sent.
 // It implements a simple, time-based cache to speed up repeated runs.
-func (c *Client) getUserFeed(uniqueID string, opt *tikwm.FeedOpt) (chan tikwm.Post, int, error) {
+func (c *Client) getUserFeed(ctx context.Context, uniqueID string, opt *tikwm.FeedOpt) (chan tikwm.Post, int, error) {
 	opt = opt.Defaults()
 
 	if c.cfg.FeedCache {
@@ -895,7 +971,7 @@ func (c *Client) getUserFeed(uniqueID string, opt *tikwm.FeedOpt) (chan tikwm.Po
 	}
 
 	// Fetch from API if cache is disabled, missed, or failed
-	allPosts, err := c.userFeedSinceInternal(uniqueID, "0", opt, 0)
+	allPosts, err := c.userFeedSinceInternal(ctx, uniqueID, "0", opt, 0)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1008,15 +1084,31 @@ func (c *Client) getFeedCachePath(username string) (string, error) {
 }
 
 // userFeedSinceInternal is a recursive function that fetches user feed posts since a given cursor.
-func (c *Client) userFeedSinceInternal(uniqueID string, cursor string, opt *tikwm.FeedOpt, currentCount int) ([]tikwm.Post, error) {
+func (c *Client) userFeedSinceInternal(ctx context.Context, uniqueID string, cursor string, opt *tikwm.FeedOpt, currentCount int) ([]tikwm.Post, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
 	feed, err := tikwm.GetUserFeedRaw(uniqueID, tikwm.MaxUserFeedCount, cursor)
 	if err != nil {
-		// Specific handling for rate limit errors
-		if strings.Contains(err.Error(), "(-1)") || strings.Contains(err.Error(), "Free Api Limit") || strings.Contains(err.Error(), "(429)") {
+		if tikwm.IsDailyRateLimitError(err) {
+			network.MarkCurrentAddressAsExhausted()
+			opt.OnError(fmt.Errorf("daily rate limit hit. Rotating IP and retrying feed from cursor %s", cursor))
+			// Retry the same request. The network manager will use the next available IP.
+			return c.userFeedSinceInternal(ctx, uniqueID, cursor, opt, currentCount)
+		}
+
+		if strings.Contains(err.Error(), "(-1)") || strings.Contains(err.Error(), "(429)") {
 			if c.cfg.RetryOn429 {
 				opt.OnError(fmt.Errorf("rate limited, retrying feed from cursor %s", cursor))
-				time.Sleep(2 * time.Second) // Wait and retry the same request
-				return c.userFeedSinceInternal(uniqueID, cursor, opt, currentCount)
+				select {
+				case <-time.After(2 * time.Second): // Wait and retry the same request
+					return c.userFeedSinceInternal(ctx, uniqueID, cursor, opt, currentCount)
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
 			}
 		}
 		return nil, err
@@ -1040,7 +1132,7 @@ func (c *Client) userFeedSinceInternal(uniqueID string, cursor string, opt *tikw
 	if !feed.HasMore {
 		return ret, nil
 	}
-	deeperRet, err := c.userFeedSinceInternal(uniqueID, feed.Cursor, opt, newTotal)
+	deeperRet, err := c.userFeedSinceInternal(ctx, uniqueID, feed.Cursor, opt, newTotal)
 	if err != nil {
 		return ret, err
 	}

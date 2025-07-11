@@ -19,13 +19,15 @@ const AppName = "tikwm"
 
 // Config extends the core config with CLI-specific options.
 type Config struct {
-	config.Config   `koanf:",squash"`
-	TargetsFile     string `koanf:"targets_file"`
-	DatabasePath    string `koanf:"database_path"`
-	Editor          string `koanf:"editor"`
-	CheckForUpdates bool   `koanf:"check_for_updates"` // Check for new versions on startup.
-	AutoUpdate      bool   `koanf:"auto_update"`       // Automatically install new versions.
-	MaxWorkers      int    `koanf:"max_workers"`       // Maximum number of concurrent workers.
+	config.Config      `koanf:",squash"`
+	TargetsFile        string `koanf:"targets_file"`
+	DatabasePath       string `koanf:"database_path"`
+	Editor             string `koanf:"editor"`
+	CheckForUpdates    bool   `koanf:"check_for_updates"` // Check for new versions on startup.
+	AutoUpdate         bool   `koanf:"auto_update"`       // Automatically install new versions.
+	MaxWorkers         int    `koanf:"max_workers"`       // Maximum number of concurrent workers.
+	DaemonMode         bool   `koanf:"daemon_mode"`
+	DaemonPollInterval string `koanf:"daemon_poll_interval"`
 }
 
 // Default returns the default CLI configuration.
@@ -41,13 +43,15 @@ func Default() (*Config, error) {
 	}
 
 	return &Config{
-		Config:          *coreCfg,
-		DatabasePath:    dbPath,
-		TargetsFile:     targetsPath,
-		Editor:          "", // Default editor is determined in the 'edit' command logic
-		CheckForUpdates: true,
-		AutoUpdate:      false,
-		MaxWorkers:      runtime.NumCPU(),
+		Config:             *coreCfg,
+		DatabasePath:       dbPath,
+		TargetsFile:        targetsPath,
+		Editor:             "", // Default editor is determined in the 'edit' command logic
+		CheckForUpdates:    true,
+		AutoUpdate:         false,
+		MaxWorkers:         runtime.NumCPU(),
+		DaemonMode:         false,
+		DaemonPollInterval: "60s",
 	}, nil
 }
 
@@ -132,11 +136,22 @@ retry_on_429: %t
 # Path to the ffmpeg executable. Used to validate downloaded videos.
 ffmpeg_path: "%s"
 
+# Network
+# Specify the local IP address or network interface name for outbound connections.
+# Leave blank to let the OS decide. Examples: "192.168.1.100", "eth0"
+bind_address: "%s"
+
 # Caching
 # Enable caching of user feeds to speed up repeated runs.
 feed_cache: %t
 # How long to keep feed cache before it's considered stale (e.g., "1h", "30m", "2h15m").
 feed_cache_ttl: "%s"
+
+# Daemon Mode (for use with targets file)
+# When enabled, the app will run continuously and poll for new content at a reduced rate after a full pass.
+daemon_mode: %t
+# The interval to wait between checks when in low-frequency daemon poll state.
+daemon_poll_interval: "%s"
 
 # Other
 # Editor to use for the 'edit' command. If empty, it will check $EDITOR, then common editors.
@@ -145,7 +160,7 @@ editor: "%s"
 check_for_updates: %t
 # Automatically install new versions of tikwm. If false, you will be notified to run 'tikwm update'.
 auto_update: %t
-`, cfg.DownloadPath, cfg.TargetsFile, cfg.DatabasePath, cfg.MaxWorkers, cfg.Quality, cfg.Since, cfg.DownloadCovers, cfg.CoverType, cfg.DownloadAvatars, cfg.SavePostTitle, cfg.RetryOn429, cfg.FfmpegPath, cfg.FeedCache, cfg.FeedCacheTTL, cfg.Editor, cfg.CheckForUpdates, cfg.AutoUpdate)
+`, cfg.DownloadPath, cfg.TargetsFile, cfg.DatabasePath, cfg.MaxWorkers, cfg.Quality, cfg.Since, cfg.DownloadCovers, cfg.CoverType, cfg.DownloadAvatars, cfg.SavePostTitle, cfg.RetryOn429, cfg.FfmpegPath, cfg.BindAddress, cfg.FeedCache, cfg.FeedCacheTTL, cfg.DaemonMode, cfg.DaemonPollInterval, cfg.Editor, cfg.CheckForUpdates, cfg.AutoUpdate)
 	content = strings.ReplaceAll(content, "\\", "/")
 	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
 		return fmt.Errorf("failed to write default config file: %w", err)

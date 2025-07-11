@@ -1,4 +1,3 @@
-// tools/tikwm/internal/update/update.go
 package update
 
 import (
@@ -271,7 +270,7 @@ func ApplyUpdate(console *cli.Console, currentVersion string) error {
 	}
 
 	console.Info("Downloading: %s", assetName)
-	resp, err := http.Get(assetURL) // #nosec G107
+	resp, err := http.DefaultClient.Get(assetURL) // #nosec G107
 	if err != nil {
 		return fmt.Errorf("failed to download asset: %w", err)
 	}

@@ -156,8 +156,8 @@ func submitSourceEncodeTask(videoID string) (string, error) {
 	formData.Set("web", "1")                            // Set the web parameter.
 	formData.Set("url", videoID)                        // Set the URL parameter.
 
-	// Execute the HTTP request.
-	httpResp, err := http.PostForm(urlPath, formData) // #nosec G107
+	// Execute the HTTP request using the DefaultClient to respect custom transports.
+	httpResp, err := http.DefaultClient.PostForm(urlPath, formData)
 	if err != nil {
 		return "", err // Return an error if the request failed.
 	}
@@ -197,6 +197,9 @@ func pollSourceEncodeResult(taskID string) (*SourceEncodeResult, error) {
 		// The polling loop itself calls RawParsed, which is rate-limited.
 		data, err := RawParsed[json.RawMessage]("video/task/result", map[string]string{"task_id": taskID})
 		if err != nil {
+			if IsDailyRateLimitError(err) {
+				return nil, err // Propagate the rate limit error to be handled by the caller.
+			}
 			if strings.Contains(err.Error(), "(-1)") { // Is it a rate limit error?
 				time.Sleep(2 * time.Second) // Wait a bit longer if rate limited during polling
 			}
@@ -246,4 +249,13 @@ func GetUserFeedRaw(uniqueID string, count int, cursor string) (*UserFeed, error
 func GetUserDetail(uniqueID string) (*UserDetail, error) {
 	query := map[string]string{"unique_id": uniqueID} // Construct the query parameters.
 	return RawParsed[UserDetail]("user/info", query)  // Execute the raw request.
+}
+
+// IsDailyRateLimitError checks if an error message indicates a daily API limit has been reached.
+func IsDailyRateLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// The API returns this specific string for the daily limit.
+	return strings.Contains(err.Error(), "Free Api Limit: 10000 request/ 1 day.")
 }
