@@ -26,9 +26,13 @@ and downloads any videos that are missing the qualities specified in your config
 		console.Info("Fixing missing videos with quality setting: %s", console.Bold.Sprint(cfg.Quality))
 		workerPool := pool.New(cfg.MaxWorkers, len(targets))
 
-		for _, target := range targets {
-			username := client.ExtractUsername(target) // Capture for closure
+		for _, targetStr := range targets {
+			target := targetStr // Capture for closure
 			workerPool.Submit(func() {
+				// Resolve short links inside the worker to avoid blocking the main thread
+				target = resolveIfShort(target)
+				username := client.ExtractUsername(target)
+
 				ctx := context.Background()
 				console.AddTask(username, "Starting fix...", cli.OpFeedFetch)
 				progressCb := func(current, total int, msg string) {
