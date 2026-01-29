@@ -17,6 +17,9 @@ var infoCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		// Iterate over the provided target usernames or URLs.
 		for _, target := range args {
+			// Resolve short links if detected (e.g., vt.tiktok.com)
+			target = resolveIfShort(target)
+
 			// Extract the username from the target.
 			username := client.ExtractUsername(target)
 			// Print a message indicating that we are fetching information for the user.
