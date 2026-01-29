@@ -7,15 +7,18 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/adrg/xdg"
 	tikwm "github.com/perpetuallyhorni/tikwm/internal"
 	"github.com/perpetuallyhorni/tikwm/pkg/client"
 	"github.com/perpetuallyhorni/tikwm/pkg/logging"
+	"github.com/perpetuallyhorni/tikwm/pkg/network"
 	"github.com/perpetuallyhorni/tikwm/tools/tikwm/internal/cli"
 	cliconfig "github.com/perpetuallyhorni/tikwm/tools/tikwm/internal/config"
 	"github.com/spf13/cobra"
@@ -25,6 +28,60 @@ import (
 type ParsedTarget struct {
 	Type  string // "user" or "post"
 	Value string // original string
+}
+
+// resolveShortLink resolves a short TikTok URL to its canonical form.
+func resolveShortLink(shortURL string) (string, error) {
+	// Use the global API transport to respect IP rotation/proxy config if available.
+	// We create a custom client to handle redirects manually (HEAD + ErrUseLastResponse)
+	// as short links usually return a 301/302 with the target in Location.
+	client := &http.Client{
+		Transport: network.GetApiClient().Transport,
+		Timeout:   10 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	req, err := http.NewRequest("HEAD", shortURL, nil)
+	if err != nil {
+		return "", err
+	}
+	// Mimic a browser UA to ensure we get the correct redirect
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	finalURL := resp.Header.Get("Location")
+	if finalURL == "" {
+		// If no redirect, return original (might be already resolved or invalid)
+		return shortURL, nil
+	}
+
+	// Parse and clean the resolved URL
+	u, err := url.Parse(finalURL)
+	if err != nil {
+		return "", err
+	}
+	u.RawQuery = ""
+	u.Fragment = ""
+	return strings.TrimSuffix(u.String(), "/"), nil
+}
+
+// resolveIfShort checks if the target is a short link and resolves it if so.
+// If resolution fails or it's not a short link, it returns the original string.
+func resolveIfShort(target string) string {
+	trimmed := strings.TrimSpace(target)
+	if strings.Contains(trimmed, "vt.tiktok.com") || strings.Contains(trimmed, "vm.tiktok.com") {
+		if resolved, err := resolveShortLink(trimmed); err == nil && resolved != "" {
+			return resolved
+		}
+	}
+	return trimmed
 }
 
 // applyFlagOverrides applies command-line flag overrides to the configuration.
@@ -68,7 +125,20 @@ func applyFlagOverrides(cmd *cobra.Command, cfg *cliconfig.Config) {
 		cfg.FeedCacheTTL, _ = cmd.Flags().GetString("feed-cache-ttl")
 	}
 	if cmd.Flag("bind").Changed {
-		cfg.BindAddress, _ = cmd.Flags().GetString("bind")
+		val, _ := cmd.Flags().GetString("bind")
+		// Apply to both if they are not set by their specific flags.
+		if !cmd.Flag("api-bind").Changed {
+			cfg.ApiBindAddress = val
+		}
+		if !cmd.Flag("download-bind").Changed {
+			cfg.DownloadBindAddress = val
+		}
+	}
+	if cmd.Flag("api-bind").Changed {
+		cfg.ApiBindAddress, _ = cmd.Flags().GetString("api-bind")
+	}
+	if cmd.Flag("download-bind").Changed {
+		cfg.DownloadBindAddress, _ = cmd.Flags().GetString("download-bind")
 	}
 	if cmd.Flag("daemon").Changed {
 		cfg.DaemonMode, _ = cmd.Flags().GetBool("daemon")
@@ -122,6 +192,10 @@ func getTargetsFromFile(filePath string, console *cli.Console) []string {
 // parseTarget parses a target string and determines its type (user or post).
 func parseTarget(target string) ParsedTarget {
 	trimmedTarget := strings.TrimSpace(target)
+
+	// Resolve short links if detected
+	trimmedTarget = resolveIfShort(trimmedTarget)
+
 	if strings.Contains(trimmedTarget, "tiktok.com") && strings.Contains(trimmedTarget, "/video/") {
 		return ParsedTarget{Type: "post", Value: trimmedTarget}
 	}
